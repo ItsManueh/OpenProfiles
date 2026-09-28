@@ -1,0 +1,9 @@
+# Normalize text files to LF in the repository
+* text=auto
+
+# Windows scripts need CRLF line endings to run correctly in cmd
+*.bat text eol=crlf
+
+# Binary files
+*.ico binary
+*.ttf binary

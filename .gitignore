@@ -1,0 +1,24 @@
+# Python environment and caches
+.venv/
+__pycache__/
+*.py[cod]
+.ruff_cache/
+
+# Browsers downloaded by Playwright (reinstalled on first run)
+browsers/
+
+# Profiles, sessions, cookies and logs: private, never commit them
+data/
+
+# PyInstaller output
+build/
+dist/
+*.spec
+
+# Editor and OS files (the shared .vscode/settings.json is kept)
+.vscode/*
+!.vscode/settings.json
+.idea/
+Thumbs.db
+Desktop.ini
+.DS_Store
