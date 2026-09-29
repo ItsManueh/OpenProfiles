@@ -1,0 +1,46 @@
+# Builds the portable OpenProfiles.exe with build.bat whenever a release is
+# published, and attaches it (with its SHA-256 checksum) to that release.
+
+name: Release executable
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write # needed to upload files to the release
+
+jobs:
+  build-exe:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Create the Python environment
+        shell: cmd
+        run: |
+          python -m venv .venv || exit /b 1
+          .venv\Scripts\python.exe -m pip install --upgrade pip || exit /b 1
+          .venv\Scripts\python.exe -m pip install -r requirements.txt pyinstaller || exit /b 1
+
+      - name: Build dist\OpenProfiles.exe
+        shell: cmd
+        run: call .\build.bat
+
+      - name: Write the checksum
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash dist\OpenProfiles.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  OpenProfiles.exe" | Set-Content dist\OpenProfiles.exe.sha256 -Encoding ascii
+          "SHA-256: $hash"
+
+      - name: Attach the files to the release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: gh release upload $env:TAG dist\OpenProfiles.exe dist\OpenProfiles.exe.sha256 --clobber --repo $env:GITHUB_REPOSITORY
