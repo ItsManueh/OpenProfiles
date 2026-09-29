@@ -1,11 +1,14 @@
 # Builds the portable OpenProfiles.exe with build.bat whenever a release is
 # published, and attaches it (with its SHA-256 checksum) to that release.
+# It can also be run by hand from the Actions tab to test the build: the files
+# are then kept as a downloadable artifact of that run instead.
 
 name: Release executable
 
 on:
   release:
     types: [published]
+  workflow_dispatch:
 
 permissions:
   contents: write # needed to upload files to the release
@@ -14,9 +17,9 @@ jobs:
   build-exe:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
 
@@ -39,8 +42,19 @@ jobs:
           "SHA-256: $hash"
 
       - name: Attach the files to the release
+        if: github.event_name == 'release'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.release.tag_name }}
         run: gh release upload $env:TAG dist\OpenProfiles.exe dist\OpenProfiles.exe.sha256 --clobber --repo $env:GITHUB_REPOSITORY
+
+      - name: Keep the files as an artifact of this run
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v7
+        with:
+          name: OpenProfiles
+          path: |
+            dist/OpenProfiles.exe
+            dist/OpenProfiles.exe.sha256
+          retention-days: 7
