@@ -4,9 +4,14 @@ Application logging.
 Every module logs through a child of the "app" logger (logging.getLogger("app.<module>")).
 setup_logging() sends those records to:
 
-- data/logs/app.log: rotating text file that survives crashes.
+- logs/app.log inside the data folder: rotating text file that survives crashes.
 - PanelHandler: in-memory buffer that feeds the Logs window in real time.
 - The terminal, when asked for and when there is one.
+
+Records about something the user did can name the kind of event, which the Logs
+window shows with the same emoji as the notification:
+
+    log.info("Created profile '%s'", name, extra={"event": "created"})
 
 It also records any unhandled exception, in the main thread or in any other thread.
 """
@@ -19,6 +24,7 @@ import platform
 import sys
 import threading
 from collections import deque
+from dataclasses import dataclass
 from types import TracebackType
 
 from profiles import DATA_DIR
@@ -31,22 +37,42 @@ DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 log = logging.getLogger("app")
 
 
-class PanelHandler(logging.Handler):
-    """Keeps the latest formatted records, plus the ones the interface has not shown yet.
+@dataclass(frozen=True)
+class LogEntry:
+    level: int
+    created: float  # time.time() of the record
+    message: str  # the message alone, followed by its traceback if there is one
+    line: str  # the full line, exactly as written to app.log
+    event: str | None = None
 
-    Each entry is (level, formatted line). Both buffers are bounded, so memory stays
-    constant even when nobody reads them (e.g. from the command line).
+    def matches(self, min_level: int, query: str = "") -> bool:
+        """query must already be lowercase."""
+        return self.level >= min_level and (not query or query in self.line.lower())
+
+
+class PanelHandler(logging.Handler):
+    """Keeps the latest entries, plus the ones the interface has not shown yet.
+
+    Both buffers are bounded, so memory stays constant even when nobody reads them
+    (e.g. from the command line).
     """
 
     def __init__(self, capacity: int = 5000):
         super().__init__(logging.DEBUG)
-        self._records: deque[tuple[int, str]] = deque(maxlen=capacity)
-        self._pending: deque[tuple[int, str]] = deque(maxlen=capacity)
+        self._records: deque[LogEntry] = deque(maxlen=capacity)
+        self._pending: deque[LogEntry] = deque(maxlen=capacity)
         self._buffers_lock = threading.Lock()  # records arrive from several threads
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
-            entry = (record.levelno, self.format(record))
+            line = self.format(record)  # also fills record.exc_text with the traceback
+            message = record.getMessage()
+            if record.exc_text:
+                message += "\n" + record.exc_text
+            if record.stack_info:
+                message += "\n" + record.stack_info
+            kind = getattr(record, "event", None)
+            entry = LogEntry(record.levelno, record.created, message, line, kind if isinstance(kind, str) else None)
         except Exception:  # standard logging pattern: a bad record must never break the app
             self.handleError(record)
             return
@@ -54,23 +80,27 @@ class PanelHandler(logging.Handler):
             self._records.append(entry)
             self._pending.append(entry)
 
-    def drain(self) -> list[tuple[int, str]]:
+    def drain(self) -> list[LogEntry]:
         """New entries since the last call."""
         with self._buffers_lock:
             entries = list(self._pending)
             self._pending.clear()
             return entries
 
-    def records(self, min_level: int = logging.NOTSET) -> list[tuple[int, str]]:
+    def records(self, min_level: int = logging.NOTSET, query: str = "") -> list[LogEntry]:
         with self._buffers_lock:
-            return [entry for entry in self._records if entry[0] >= min_level]
+            return [entry for entry in self._records if entry.matches(min_level, query)]
 
-    def snapshot(self, min_level: int = logging.NOTSET) -> list[tuple[int, str]]:
+    def snapshot(self, min_level: int = logging.NOTSET, query: str = "") -> list[LogEntry]:
         """Like records(), but also discards the pending entries, since the caller
         shows everything at once (avoids showing an entry twice)."""
         with self._buffers_lock:
             self._pending.clear()
-            return [entry for entry in self._records if entry[0] >= min_level]
+            return [entry for entry in self._records if entry.matches(min_level, query)]
+
+    def count(self) -> int:
+        with self._buffers_lock:
+            return len(self._records)
 
     def clear(self) -> None:
         with self._buffers_lock:

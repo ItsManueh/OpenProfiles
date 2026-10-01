@@ -29,8 +29,13 @@ def log(message: str) -> None:
 
 def snapshot() -> dict[Path, float]:
     """Modification time of every .py file of the app (project root and the ui package)."""
-    files = [*BASE_DIR.glob("*.py"), *(BASE_DIR / "ui").rglob("*.py")]
-    return {path: path.stat().st_mtime for path in files}
+    times: dict[Path, float] = {}
+    for path in [*BASE_DIR.glob("*.py"), *(BASE_DIR / "ui").rglob("*.py")]:
+        try:
+            times[path] = path.stat().st_mtime
+        except OSError:  # deleted or renamed while scanning (editors save through temporary files)
+            continue
+    return times
 
 
 def compile_errors(paths: list[Path]) -> list[str]:
@@ -40,6 +45,8 @@ def compile_errors(paths: list[Path]) -> list[str]:
             py_compile.compile(str(path), doraise=True)
         except py_compile.PyCompileError as e:
             errors.append(e.msg.strip())
+        except OSError:  # deleted since it was seen; nothing to check
+            continue
     return errors
 
 

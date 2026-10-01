@@ -27,6 +27,7 @@ FilesFuture = concurrent.futures.Future[list[str]]
 
 class ServiceSignals(QObject):
     ready = Signal()
+    installed = Signal()  # the browsers finished downloading (first run)
     info = Signal(str)
     failed = Signal(str)
     state = Signal(str, str, str)  # profile name, state ("opened", "warning", "error", "closed", "done"), message
@@ -57,10 +58,12 @@ class BrowserService:
             if not launcher.browsers_installed():
                 self.signals.info.emit("Downloading browsers (first run only)…")
                 launcher.install_browsers(quiet=True)
+                self.signals.installed.emit()
             self.loop.run_until_complete(self._start_playwright())
         except Exception as e:  # shown in the interface
             log.exception("The browser engine could not start")
             self.signals.failed.emit(f"The browser engine could not start: {e}")
+            self.loop.close()
             return
         self.ready.set()
         self.signals.ready.emit()
@@ -115,9 +118,11 @@ class BrowserService:
     async def _run_profile(self, profile: Profile) -> None:
         try:
             if self.pw is None:
+                log.error("Could not open '%s': the browser engine is not running", profile.name)
                 self._notify(profile.name, "error", "The browser engine is not running.")
                 return
             if profile.mode == "iphone" and profile.device not in self.devices:
+                log.error("Could not open '%s': unknown device '%s'", profile.name, profile.device)
                 self._notify(profile.name, "error", f"Unknown device '{profile.device}'.")
                 return
             await launcher.run_profile(

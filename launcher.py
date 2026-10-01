@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import subprocess
@@ -48,8 +49,33 @@ DESKTOP_WINDOW_MAX = (1440, 900)
 # ----------------------------------------------------------------------------
 
 
+REQUIRED_BROWSERS = ("webkit", "chromium")
+
+
+@lru_cache(maxsize=1)
+def required_browser_folders() -> list[str]:
+    """Folders of the browser builds this version of Playwright needs, e.g. "chromium-1243".
+    Empty if Playwright's list cannot be read."""
+    try:
+        path = Path(playwright.__file__).parent / "driver" / "package" / "browsers.json"
+        browsers = json.loads(path.read_text(encoding="utf-8"))["browsers"]
+        revisions = {b["name"]: b["revision"] for b in browsers if b["name"] in REQUIRED_BROWSERS}
+        return [f"{name}-{revisions[name]}" for name in REQUIRED_BROWSERS]
+    except (OSError, ValueError, KeyError, TypeError):
+        return []
+
+
 def browsers_installed() -> bool:
-    return any(BROWSERS_DIR.glob("webkit-*")) and any(BROWSERS_DIR.glob("chromium-*"))
+    """Whether WebKit and Chromium are fully downloaded. Playwright writes INSTALLATION_COMPLETE
+    at the end, so a download cut halfway (the app closed, the connection dropped) does not count,
+    and neither do the builds of an older Playwright."""
+    folders = required_browser_folders()
+    if not folders:  # unknown revisions: any complete build will do
+        return all(
+            any((folder / "INSTALLATION_COMPLETE").exists() for folder in BROWSERS_DIR.glob(f"{name}-*"))
+            for name in REQUIRED_BROWSERS
+        )
+    return all((BROWSERS_DIR / folder / "INSTALLATION_COMPLETE").exists() for folder in folders)
 
 
 def driver_command() -> list[str]:
@@ -89,7 +115,7 @@ def install_browsers(quiet: bool = False) -> None:
         log.error("Browser installation failed (exit code %s) %s", result.returncode, details)
         raise RuntimeError("The browsers could not be installed.")
     print("Browsers installed.")
-    log.info("Browsers installed")
+    log.info("Browsers installed", extra={"event": "downloaded"})
 
 
 def playwright_devices(pw: Playwright) -> Devices:
@@ -301,13 +327,17 @@ async def run_profile(
     choose = choose_files or _ask_files_in_thread
     name = profile.name
     log.info("Launching '%s' (%s)", name, describe(profile))
-    profile.folder.mkdir(parents=True, exist_ok=True)
     browser_type = pw.webkit if profile.engine == "webkit" else pw.chromium
     try:
+        profile.folder.mkdir(parents=True, exist_ok=True)
         context = await browser_type.launch_persistent_context(str(profile.folder), **launch_options(profile, devices))
+    except OSError as e:
+        log.error("Could not create the data folder of '%s': %s", name, e)
+        notify(name, "error", f"Could not create the profile's data folder: {e}")
+        return
     except PlaywrightError as e:
         log.error("Could not launch '%s': %s", name, e)
-        notify(name, "error", f"Could not open it (is it already open?): {_first_line(e)}")
+        notify(name, "error", f"Could not open the profile (is it already open?): {_first_line(e)}")
         return
 
     # Registered first, so the close is not missed if the window closes right away.
@@ -367,7 +397,7 @@ async def run_profile(
         for page in context.pages:
             prepare_page(page)
         label = profile.device if profile.mode == "iphone" else "desktop"
-        log.info("'%s' is open as %s", name, label)
+        log.info("'%s' is open as %s", name, label, extra={"event": "opened"})
         notify(name, "opened", f"Opened as {label} ({profile.engine}).")
         try:
             if profile.mode == "iphone":
@@ -385,7 +415,7 @@ async def run_profile(
         await close_quietly(context)
         if contexts is not None:
             contexts.pop(name, None)
-        log.info("'%s' closed, session saved", name)
+        log.info("'%s' closed, session saved", name, extra={"event": "closed"})
         notify(name, "closed", "Closed. Session saved.")
 
 

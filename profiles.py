@@ -9,6 +9,7 @@ Each profile has its own data folder (cookies, session, cache) and one of two mo
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -160,7 +161,10 @@ def load_profiles() -> dict[str, Profile]:
         items = [Profile(**{k: v for k, v in item.items() if k in known}) for item in raw["profiles"]]
         if any(not isinstance(getattr(p, f), str) for p in items for f in known):
             raise TypeError("every profile value must be text")
-    except (json.JSONDecodeError, KeyError, TypeError, AttributeError) as e:
+    except OSError as e:  # locked or unreadable (permissions, disk)
+        log.error("Could not read %s: %s", PROFILES_FILE, e)
+        raise ProfileError(f"Could not read {PROFILES_FILE.name}: {e}") from e
+    except (ValueError, KeyError, TypeError, AttributeError) as e:  # ValueError: bad JSON or not UTF-8
         log.error("Could not read %s: %s", PROFILES_FILE, e)
         raise ProfileError(f"{PROFILES_FILE} is corrupted: {e}") from e
     profiles: dict[str, Profile] = {}
@@ -343,7 +347,7 @@ def create_profile(profile: Profile, devices: Devices) -> Profile:
     profile.folder.mkdir(parents=True, exist_ok=True)
     profiles[profile.name] = profile
     save_profiles(profiles)
-    log.info("Created profile '%s' (%s)", profile.name, describe(profile))
+    log.info("Created profile '%s' (%s)", profile.name, describe(profile), extra={"event": "created"})
     return profile
 
 
@@ -356,23 +360,30 @@ def update_profile(current_name: str, profile: Profile, devices: Devices) -> Pro
         raise ProfileError(f"A profile named '{profile.name}' already exists.")
     profile = _prepare(profile, profiles, devices)
 
-    if profile.name != current_name:
-        source = profiles[current_name].folder
-        if source.exists():
-            try:
-                source.rename(profile.folder)
-            except FileExistsError as e:
-                raise ProfileError(f"A data folder named '{profile.name}' already exists.") from e
-            except PermissionError as e:
-                raise ProfileError(f"Profile '{current_name}' is open. Close it before renaming it.") from e
-        log.info("Renamed profile '%s' to '%s'", current_name, profile.name)
+    source = profiles[current_name].folder
+    renamed = profile.name != current_name and source.exists()
+    if renamed:
+        try:
+            source.rename(profile.folder)
+        except FileExistsError as e:
+            raise ProfileError(f"A data folder named '{profile.name}' already exists.") from e
+        except PermissionError as e:
+            raise ProfileError(f"Profile '{current_name}' is open. Close it before renaming it.") from e
     # Rebuild the dictionary to keep the list order.
-    profiles = {
+    updated = {
         (profile.name if name == current_name else name): (profile if name == current_name else p)
         for name, p in profiles.items()
     }
-    save_profiles(profiles)
-    log.info("Updated profile '%s' (%s)", profile.name, describe(profile))
+    try:
+        save_profiles(updated)
+    except OSError:
+        if renamed:  # keep the folder and the list in agreement
+            with contextlib.suppress(OSError):
+                profile.folder.rename(source)
+        raise
+    if profile.name != current_name:
+        log.info("Renamed profile '%s' to '%s'", current_name, profile.name, extra={"event": "edited"})
+    log.info("Updated profile '%s' (%s)", profile.name, describe(profile), extra={"event": "edited"})
     return profile
 
 
@@ -385,6 +396,8 @@ def delete_profile(name: str) -> None:
             shutil.rmtree(profiles[name].folder)
         except PermissionError as e:
             raise ProfileError(f"Profile '{name}' is open. Close it before deleting it.") from e
+        except OSError as e:  # e.g. a file still in use by another program
+            raise ProfileError(f"Could not delete the data of '{name}': {e}") from e
     del profiles[name]
     save_profiles(profiles)
-    log.info("Deleted profile '%s' and its data", name)
+    log.info("Deleted profile '%s' and its data", name, extra={"event": "deleted"})

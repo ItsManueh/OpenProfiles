@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from PySide6.QtWidgets import QComboBox, QDialog, QGridLayout, QLayout, QLineEdit, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QComboBox, QGridLayout, QLineEdit, QWidget
 
 from profiles import (
     IPHONE_MODELS,
@@ -17,6 +17,7 @@ from profiles import (
     pick_device,
 )
 from ui.controller import AppController
+from ui.dialog import Dialog
 from ui.widgets import SegmentedControl, hbox, make_button, make_label
 
 RANDOM = "Random"
@@ -51,7 +52,7 @@ def combo(options: Sequence[str], current: str) -> QComboBox:
     return box
 
 
-class ProfileDialog(QDialog):
+class ProfileDialog(Dialog):
     """Creates a profile (profile=None) or edits one.
 
     In "Desktop" mode the engine is always Chromium, so the iPhone model, engine
@@ -59,30 +60,21 @@ class ProfileDialog(QDialog):
     """
 
     def __init__(self, controller: AppController, profile: Profile | None = None, parent: QWidget | None = None):
-        super().__init__(parent)
-        self.controller = controller
-        self.devices = controller.iphones
-        self.original = profile
-        self.saved: Profile | None = None
         editing = profile is not None
-        # Last user-agent filled in automatically: unless the user edited it by
-        # hand, it is regenerated when the mode or model changes.
-        self._auto_user_agent = profile.user_agent if profile else ""
-        self.setWindowTitle("Edit profile" if editing else "New profile")
-
-        root = QVBoxLayout(self)
-        root.setContentsMargins(30, 26, 30, 26)
-        root.setSpacing(0)
-        root.setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)  # the dialog always fits its content
-        root.addWidget(make_label("Edit profile" if editing else "New profile", name="dialogTitle"))
-        root.addSpacing(4)
         subtitle = (
             "Changes apply the next time you open the profile."
             if editing
             else "Each profile keeps its own session, isolated from the rest."
         )
-        root.addWidget(make_label(subtitle, "muted"))
-        root.addSpacing(16)
+        super().__init__("Edit profile" if editing else "New profile", subtitle, parent)
+        self.controller = controller
+        self.devices = controller.iphones
+        self.original = profile
+        self.saved: Profile | None = None
+        # Last user-agent filled in automatically: unless the user edited it by
+        # hand, it is regenerated when the mode or model changes.
+        self._auto_user_agent = profile.user_agent if profile else ""
+        root = self.body
 
         grid = QGridLayout()
         grid.setHorizontalSpacing(16)
@@ -96,23 +88,23 @@ class ProfileDialog(QDialog):
         self.name_edit.setPlaceholderText("account_1")
         self._add_field("Name", self.name_edit, row=0, span=2)
 
-        self.mode = SegmentedControl(list(MODE_LABELS.values()))
+        self.mode = SegmentedControl(list(MODE_LABELS.values()), expand=True)
         self.mode.changed.connect(self._on_mode_change)
         self._add_field("Mode", self.mode, row=2, span=2)
 
         # iPhone mode only
         models = list(reversed(list(self.devices)))
         self.device_box = combo(models if editing else [RANDOM, *models], RANDOM)
-        self.engine = SegmentedControl(list(ENGINE_LABELS.values()))
+        self.engine = SegmentedControl(list(ENGINE_LABELS.values()), expand=True)
         self.engine.changed.connect(self._on_engine_change)
-        self.quality = SegmentedControl(list(QUALITY_LABELS.values()))
+        self.quality = SegmentedControl(list(QUALITY_LABELS.values()), expand=True)
         self._iphone_fields = [
             *self._add_field("iPhone", self.device_box, row=4, span=2),
             *self._add_field("Engine", self.engine, row=6),
         ]
         self._quality_fields = self._add_field("WebKit quality", self.quality, row=6, column=1)
 
-        self.browser_theme = SegmentedControl(list(THEME_LABELS.values()))
+        self.browser_theme = SegmentedControl(list(THEME_LABELS.values()), expand=True)
         self._add_field("Browser theme", self.browser_theme, row=8)
         locale = profile.locale if profile else "es-ES"
         self.locale_box = combo(with_current(LOCALES, locale), locale)
@@ -141,9 +133,9 @@ class ProfileDialog(QDialog):
         root.addWidget(self.error)
         root.addSpacing(18)
 
-        cancel = make_button("Cancel", width=110)
+        cancel = make_button("Cancel", width=104)
         cancel.clicked.connect(self.reject)
-        save = make_button("Save" if editing else "Create", "primary", width=110)
+        save = make_button("Save" if editing else "Create", "primary", width=104)
         save.clicked.connect(self._save)
         save.setDefault(True)  # Enter saves
         root.addLayout(hbox(None, cancel, save))
@@ -242,7 +234,11 @@ class ProfileDialog(QDialog):
         if self.selected_mode() == "iphone":
             device = self.device_box.currentText()
             if device == RANDOM:
-                used = {p.device for p in load_profiles().values()}
+                used: set[str]
+                try:
+                    used = {p.device for p in load_profiles().values()}
+                except ProfileError:
+                    used = set()  # unreadable list: any model will do
                 self.device_box.blockSignals(True)  # the user-agent is set right below
                 self.device_box.setCurrentText(pick_device(used, self.devices))
                 self.device_box.blockSignals(False)

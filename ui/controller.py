@@ -25,7 +25,8 @@ class AppController(QObject):
     profiles_changed = Signal()  # the list of profiles must be redrawn
     state_changed = Signal(str, str)  # profile name, new state
     ready_changed = Signal(bool)  # the browser engine is (not) ready
-    message = Signal(str, bool)  # text for the status bar, is it an error
+    message = Signal(str, bool)  # progress text for the status bar, or an error (shown as a notification)
+    notified = Signal(str, str, str)  # event kind (created, opened, error...), profile name, detail
     files_requested = Signal(bool, str, object)  # multiple, accept, future to resolve with the paths
     shutdown_finished = Signal()
 
@@ -35,8 +36,10 @@ class AppController(QObject):
         self.ready = False
         self.states: dict[str, str] = {}
         self.closing = False
+        self._load_error = ""  # last error reading profiles.json, reported once
         signals = self.service.signals
         signals.ready.connect(self._on_ready)
+        signals.installed.connect(self._on_installed)
         signals.info.connect(self._on_info)
         signals.failed.connect(self._on_failed)
         signals.state.connect(self._on_state)
@@ -57,10 +60,15 @@ class AppController(QObject):
 
     def profiles(self) -> dict[str, Profile]:
         try:
-            return load_profiles()
+            profiles = load_profiles()
         except ProfileError as e:
-            self.message.emit(str(e), True)
+            # The list is redrawn often; the same problem is reported only once.
+            if str(e) != self._load_error:
+                self._load_error = str(e)
+                self.message.emit(str(e), True)
             return {}
+        self._load_error = ""
+        return profiles
 
     def state_of(self, name: str) -> str:
         return self.states.get(name, CLOSED)
@@ -82,25 +90,28 @@ class AppController(QObject):
             log.warning("Could not save profile '%s': %s", profile.name, e)
             raise ProfileError(str(e)) from e
         self.profiles_changed.emit()
+        # The details of the notifications never include the name of the profile.
         if original_name is None:
-            label = saved.device if saved.mode == "iphone" else "a desktop"
-            self.message.emit(f'Profile "{saved.name}" created as {label}.', False)
+            self.notified.emit("created", saved.name, saved.device if saved.mode == "iphone" else "Desktop")
+        elif original_name != saved.name:
+            self.notified.emit("edited", saved.name, "Renamed")
         else:
-            self.message.emit(f'Changes saved to "{saved.name}".', False)
+            self.notified.emit("edited", saved.name, "Applied the next time it opens")
         return saved
 
     def delete_profile(self, name: str) -> None:
         if name in self.states:
             log.warning("Tried to delete '%s' while it is open", name)
-            self.message.emit("Close the profile before deleting it.", True)
+            self.notified.emit("warning", name, "Close the profile before deleting it.")
             return
         try:
             delete_profile(name)
         except ProfileError as e:
-            self.message.emit(str(e), True)
+            log.warning("Could not delete '%s': %s", name, e)
+            self.notified.emit("error", name, "Could not delete the profile. The details are in the logs.")
             return
         self.profiles_changed.emit()
-        self.message.emit(f'Profile "{name}" deleted.', False)
+        self.notified.emit("deleted", name, "Session and data removed")
 
     # --- opening and closing ------------------------------------------------
     def open_profile(self, name: str) -> None:
@@ -112,7 +123,6 @@ class AppController(QObject):
             return
         log.info("Open requested for '%s'", profile.name)
         self._set_state(profile.name, OPENING)
-        self.message.emit(f'Opening "{profile.name}"…', False)
         self.service.open(profile)
 
     def close_profile(self, name: str) -> None:
@@ -137,6 +147,9 @@ class AppController(QObject):
         if self.closing:
             return
         self.closing = True
+        # Nothing new may open while the profiles close; the interface disables its buttons.
+        self.ready = False
+        self.ready_changed.emit(False)
         log.info("Closing the app (%d profile(s) open)", self.open_count())
         self.message.emit("Closing profiles and saving sessions…", False)
 
@@ -155,25 +168,30 @@ class AppController(QObject):
             self.states[name] = state
         self.state_changed.emit(name, state)
 
+    def _on_installed(self) -> None:
+        self.notified.emit("downloaded", "", "WebKit and Chromium are ready to use")
+
     def _on_info(self, text: str) -> None:
         self.message.emit(text, False)
 
     def _on_failed(self, text: str) -> None:
+        self.message.emit("", False)  # clears "Preparing browsers…"
         self.message.emit(text, True)
 
     def _on_ready(self) -> None:
         self.ready = True
         self.ready_changed.emit(True)
         self.profiles_changed.emit()  # redraws the list with the buttons enabled
-        self.message.emit("Ready.", False)
+        self.message.emit("", False)  # clears "Preparing browsers…"
 
     def _on_state(self, name: str, state: str, text: str) -> None:
         if state == "opened":
             self._set_state(name, OPENED)
-            self.message.emit(f'"{name}" is open.', False)
+            self.notified.emit("opened", name, "")
         elif state in ("error", "warning"):
-            self.message.emit(f'"{name}": {text}', True)
+            self.notified.emit(state, name, text)
         elif state == "closed":
-            self.message.emit(f'"{name}": {text}', False)
+            if not self.closing:  # quitting the app closes them all; no need to announce each one
+                self.notified.emit("closed", name, "Session saved")
         elif state == "done":
             self._set_state(name, CLOSED)

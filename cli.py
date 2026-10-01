@@ -83,7 +83,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    logs.setup_logging()  # the command line also writes to data/logs/app.log
+    logs.setup_logging()  # the command line also writes to logs/app.log in the data folder
     try:
         if args.command == "list":
             print_profiles()
@@ -121,7 +121,7 @@ def main(argv: list[str] | None = None) -> int:
             launcher.install_browsers()
         else:
             parser.print_help()
-    except (ProfileError, RuntimeError) as e:
+    except (ProfileError, RuntimeError, OSError) as e:
         print(f"[!] {e}")
         return 1
     return 0
