@@ -4,27 +4,42 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from datetime import datetime
+from pathlib import Path
 
 from PySide6.QtCore import (
     QByteArray,
     QEasingCurve,
     QEvent,
+    QObject,
     QParallelAnimationGroup,
     QPoint,
     QPropertyAnimation,
+    QRectF,
     Qt,
     QTimer,
     QUrl,
 )
-from PySide6.QtGui import QCloseEvent, QDesktopServices, QKeySequence, QShortcut
+from PySide6.QtGui import (
+    QCloseEvent,
+    QDesktopServices,
+    QEnterEvent,
+    QIcon,
+    QKeyEvent,
+    QKeySequence,
+    QMouseEvent,
+    QPainter,
+    QPaintEvent,
+    QShortcut,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
     QFileDialog,
     QFrame,
     QGraphicsOpacityEffect,
-    QGridLayout,
     QHBoxLayout,
+    QLineEdit,
     QMainWindow,
     QPushButton,
     QScrollArea,
@@ -33,25 +48,29 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import browser_session
+import diagnostics
 import launcher
 import logs
-from about import APP_NAME
+import updater
+from about import APP_NAME, REPOSITORY
 from profiles import DATA_DIR, Devices, Profile, browser_label, ios_version
 from settings import Settings, save_settings
-from ui import frame, theme
+from ui import frame, line_icons, theme
 from ui.confirm_dialog import ConfirmDialog
 from ui.controller import CLOSED, CLOSING, OPENED, OPENING, AppController
 from ui.dialog import Backdrop
 from ui.icons import IconBadge, IconButton, TerminalButton
 from ui.log_window import LogWindow
+from ui.page_dialog import PageDialog
 from ui.profile_dialog import ENGINE_LABELS, MODE_LABELS, THEME_LABELS, ProfileDialog
-from ui.release import ReleaseChecker
-from ui.service import FilesFuture
+from ui.release import ReleaseChecker, UpdateDownloader
+from ui.service import DialogFuture, FilesFuture
 from ui.settings_page import SettingsPage
 from ui.sound import NotificationSound
 from ui.title_bar import TitleBar
 from ui.toast import ToastHost
-from ui.widgets import ProfileCounter, StatusDot, hbox, make_button, make_label, restyle, set_variant
+from ui.widgets import ColorTag, ProfileCounter, StatusDot, hbox, make_button, make_label, restyle, set_variant
 
 log = logging.getLogger("app.gui")
 
@@ -60,6 +79,9 @@ STATE_LABELS = {CLOSED: "", OPENING: "Starting…", OPENED: "Running", CLOSING: 
 LOG_POLL_MS = 100  # how often new log entries are moved to the logs window
 PAGE_MS = 200  # page transition
 PAGE_SLIDE_PX = 14
+UNDO_MS = 8000  # how long a deleted profile can be restored with "Undo"
+OPENED_REFRESH_MS = 60_000  # "Opened 5 min ago" is kept up to date
+PROFILE_MIME = "application/x-openprofiles-profile"  # a card being dragged
 CHOOSER_RAISE_MS = 100  # how often the file chooser is looked for, to bring it to the front
 CHOOSER_RAISE_TRIES = 30
 # Notification title of each profile event, alone and when several are merged into one.
@@ -71,7 +93,32 @@ EVENT_TEXTS = {
     "opened": ("Profile opened", "{n} profiles opened"),
     "closed": ("Profile closed", "{n} profiles closed"),
     "downloaded": ("Browsers downloaded", "Browsers downloaded"),
+    "restored": ("Profile restored", "{n} profiles restored"),
+    "file": ("Download saved to Downloads", "{n} downloads saved to Downloads"),
 }
+
+
+def opened_ago(iso: str, now: datetime | None = None) -> str:
+    """ "Opened 5 min ago", "Opened yesterday"... from the time saved when it was last opened."""
+    if not iso:
+        return "Never opened"
+    try:
+        then = datetime.fromisoformat(iso)
+    except ValueError:
+        return ""
+    seconds = ((now or datetime.now()) - then).total_seconds()
+    if seconds < 60:
+        return "Opened just now"
+    if seconds < 3600:
+        return f"Opened {int(seconds // 60)} min ago"
+    if seconds < 86_400:
+        return f"Opened {int(seconds // 3600)} h ago"
+    days = int(seconds // 86_400)
+    if days == 1:
+        return "Opened yesterday"
+    if days < 7:
+        return f"Opened {days} days ago"
+    return f"Opened {then.day} {then.strftime('%b %Y')}"
 
 
 def describe_profile(profile: Profile, devices: Devices) -> str:
@@ -83,9 +130,66 @@ def describe_profile(profile: Profile, devices: Devices) -> str:
     return "  ·  ".join([*parts, THEME_LABELS[profile.theme]])
 
 
+class DragHandle(QWidget):
+    """The grip at the left of a card: press it and move the mouse to put the profile elsewhere."""
+
+    def __init__(self, card: ProfileCard):
+        super().__init__(card)
+        self.card = card
+        self.setFixedSize(18, 40)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.setToolTip("Drag to reorder")
+        self._hover = False
+        self._press_y: float | None = None
+        self._dragging = False
+
+    def paintEvent(self, _event: QPaintEvent) -> None:
+        painter = QPainter(self)
+        active = self._hover or self._dragging
+        color = theme.color("text") if active else theme.color("disabled")
+        line_icons.paint(painter, "grip", QRectF(1, (self.height() - 16) / 2, 16, 16), color)
+
+    def enterEvent(self, event: QEnterEvent) -> None:
+        self._hover = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event: QEvent) -> None:
+        self._hover = False
+        self.update()
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._press_y = event.globalPosition().y()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._press_y is None:
+            return
+        y = event.globalPosition().y()
+        board = self.card.main.list_widget
+        if not self._dragging and abs(y - self._press_y) >= QApplication.startDragDistance():
+            self._dragging = board.begin_drag(self.card, self._press_y)
+            self.update()
+        if self._dragging and board.dragged is self.card:  # Esc may have cancelled it
+            board.drag_to(y)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        board = self.card.main.list_widget
+        if self._dragging and board.dragged is self.card:
+            board.end_drag()
+        self._press_y = None
+        self._dragging = False
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.update()
+        super().mouseReleaseEvent(event)
+
+
 class ProfileCard(QFrame):
-    """One profile: status, name and state, summary, and its actions (open or close,
-    edit and delete)."""
+    """One profile: its grip, label color, status, name and state, summary and notes, and its
+    actions (open or close, edit, duplicate and delete)."""
 
     def __init__(self, window: MainWindow, profile: Profile):
         super().__init__()
@@ -95,10 +199,12 @@ class ProfileCard(QFrame):
         self.profile = profile
         controller = window.controller
 
+        self.handle = DragHandle(self)
         self.dot = StatusDot()
         name = make_label(profile.name, name="profileName")
         self.state_label = make_label(name="stateLabel")
-        details = make_label(describe_profile(profile, controller.devices), "muted")
+        self.details = make_label("", "muted")
+        self.notes = make_label("", "small")
         title = QHBoxLayout()
         title.setSpacing(10)
         title.addWidget(name)
@@ -107,23 +213,47 @@ class ProfileCard(QFrame):
         texts = QVBoxLayout()
         texts.setSpacing(3)
         texts.addLayout(title)
-        texts.addWidget(details)
+        texts.addWidget(self.details)
+        texts.addWidget(self.notes)
 
         self.action = make_button("Open", "primary", width=92)
         self.action.clicked.connect(self._toggle)
         self.edit = IconButton("pencil", "Edit")
         self.edit.clicked.connect(lambda: window.edit_profile(profile.name))
+        self.duplicate = IconButton("copy", "Duplicate (same settings, its own fingerprint)")
+        self.duplicate.clicked.connect(lambda: controller.duplicate_profile(profile.name))
         self.delete = IconButton("trash", "Delete", danger=True)
         self.delete.clicked.connect(lambda: window.ask_delete(profile.name))
 
-        layout = QGridLayout(self)
-        layout.setContentsMargins(20, 14, 14, 14)
-        layout.setHorizontalSpacing(14)
-        layout.addWidget(self.dot, 0, 0)
-        layout.addLayout(texts, 0, 1)
-        layout.setColumnStretch(1, 1)
-        layout.addLayout(hbox(self.action, 6, self.edit, self.delete, spacing=2), 0, 2)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(4, 12, 14, 12)
+        layout.setSpacing(8)
+        # The colored bar of the label; its place is kept without one, so every card lines up.
+        self.tag = ColorTag(profile.color)
+        layout.addWidget(self.handle)
+        layout.addWidget(self.tag)
+        layout.addSpacing(6)
+        layout.addWidget(self.dot)
+        layout.addSpacing(6)
+        layout.addLayout(texts, 1)
+        layout.addLayout(hbox(self.action, 6, self.edit, self.duplicate, self.delete, spacing=2))
+        self.update_profile(profile)
         self.set_state(controller.state_of(profile.name))
+
+    def update_profile(self, profile: Profile) -> None:
+        """Shows the profile's latest data (same name), without rebuilding the card."""
+        self.profile = profile
+        self.notes.setText(profile.notes)
+        self.notes.setToolTip(profile.notes)
+        self.notes.setVisible(bool(profile.notes))
+        self.tag.color = profile.color
+        self.tag.update()
+        self.update_opened()
+
+    def update_opened(self) -> None:
+        summary = describe_profile(self.profile, self.main.controller.devices)
+        opened = opened_ago(self.profile.last_opened)
+        self.details.setText(f"{summary}  ·  {opened}" if opened else summary)
 
     def _toggle(self) -> None:
         controller = self.main.controller
@@ -147,7 +277,165 @@ class ProfileCard(QFrame):
             set_variant(self.action, "primary")
             self.action.setEnabled(ready and state == CLOSED)
         self.edit.setEnabled(ready and state == CLOSED)
+        self.duplicate.setEnabled(ready)
         self.delete.setEnabled(state == CLOSED and not self.main.controller.closing)
+
+
+class ProfileList(QWidget):
+    """The column of cards. A card dragged by its grip follows the mouse; the others slide
+    out of its way, leaving a slot where it will land; near the top or bottom edge the list
+    scrolls; Esc puts it back. Dropping it saves the new order, without rebuilding the list."""
+
+    SLIDE_MS = 150
+    EDGE = 48  # distance to the edge of the visible list where it starts scrolling
+    SCROLL_STEP = 12
+
+    def __init__(self, window: MainWindow):
+        super().__init__()
+        self.main = window
+        self.setObjectName("profileList")
+        self.dragged: ProfileCard | None = None
+        self._slot: QFrame | None = None
+        self._origin = 0
+        self._offset = 0.0
+        self._last_y = 0.0
+        self._animations: dict[QWidget, QPropertyAnimation] = {}
+        self._scroller = QTimer(self)
+        self._scroller.setInterval(16)
+        self._scroller.timeout.connect(self._auto_scroll)
+
+    @property
+    def _layout(self) -> QVBoxLayout:
+        return self.main.list_layout
+
+    def ordered_cards(self) -> list[ProfileCard]:
+        """The cards in the order they are shown (the dragged one in its slot)."""
+        result: list[ProfileCard] = []
+        for index in range(self._layout.count()):
+            item = self._layout.itemAt(index)
+            widget = item.widget() if item is not None else None
+            if isinstance(widget, ProfileCard):
+                result.append(widget)
+            elif widget is not None and widget is self._slot and self.dragged is not None:
+                result.append(self.dragged)
+        return result
+
+    def begin_drag(self, card: ProfileCard, press_y: float) -> bool:
+        if self.dragged is not None or len(self.main.cards) < 2 or self.main.search.text().strip():
+            return False
+        self._origin = self._layout.indexOf(card)
+        geometry = card.geometry()
+        self._slot = QFrame(self)
+        self._slot.setObjectName("dropSlot")
+        self._slot.setFixedHeight(card.height())
+        self._layout.insertWidget(self._origin, self._slot)
+        self._layout.removeWidget(card)
+        card.setGeometry(geometry)  # it stays where it was, now free of the layout
+        card.raise_()
+        card.setProperty("dragging", True)
+        restyle(card)
+        self._offset = press_y - card.mapToGlobal(QPoint(0, 0)).y()
+        self.dragged = card
+        app = QApplication.instance()
+        if app is not None:
+            app.installEventFilter(self)  # Esc cancels
+        self._scroller.start()
+        return True
+
+    def drag_to(self, global_y: float) -> None:
+        card = self.dragged
+        if card is None:
+            return
+        self._last_y = global_y
+        wanted = self.mapFromGlobal(QPoint(0, round(global_y - self._offset))).y()
+        card.move(card.x(), max(0, min(wanted, self.height() - card.height())))  # drawn inside the list
+        # Where it goes follows the mouse, even past the ends (so the first and last places
+        # can always be reached).
+        self._place_slot(wanted + card.height() / 2)
+
+    def _place_slot(self, center: float) -> None:
+        slot = self._slot
+        if slot is None:
+            return
+        others = [c for c in self.ordered_cards() if c is not self.dragged]
+        # Where the layout puts each card (not where an animation is taking it right now).
+        index = 0
+        for card in others:
+            item = self._layout.itemAt(self._layout.indexOf(card))
+            if item is not None and QRectF(item.geometry()).center().y() < center:
+                index += 1
+        if index == self._layout.indexOf(slot):
+            return
+        before = {c: c.pos() for c in others}
+        self._layout.removeWidget(slot)
+        self._layout.insertWidget(index, slot)
+        self._layout.activate()
+        for c in others:
+            if c.pos() != before[c]:
+                self._slide(c, before[c], c.pos())
+        if self.dragged is not None:
+            self.dragged.raise_()
+
+    def _slide(self, widget: QWidget, start: QPoint, end: QPoint) -> None:
+        previous = self._animations.pop(widget, None)
+        if previous is not None:
+            previous.stop()
+        animation = QPropertyAnimation(widget, b"pos", self)
+        animation.setDuration(self.SLIDE_MS)
+        animation.setEasingCurve(QEasingCurve.Type.OutCubic)
+        animation.setStartValue(start)
+        animation.setEndValue(end)
+        animation.finished.connect(lambda: self._animations.pop(widget, None))
+        self._animations[widget] = animation
+        animation.start()
+
+    def end_drag(self, *, cancel: bool = False) -> None:
+        card, slot = self.dragged, self._slot
+        if card is None or slot is None:
+            return
+        app = QApplication.instance()
+        if app is not None:
+            app.removeEventFilter(self)
+        self._scroller.stop()
+        index = self._origin if cancel else self._layout.indexOf(slot)
+        start = card.pos()
+        self._layout.removeWidget(slot)
+        slot.deleteLater()
+        self._slot = None
+        self.dragged = None
+        self._layout.insertWidget(index, card)
+        self._layout.activate()
+        self._slide(card, start, card.pos())  # it glides into its place
+        card.setProperty("dragging", False)
+        restyle(card)
+        if not cancel:
+            self.main.save_order()
+
+    def _auto_scroll(self) -> None:
+        if self.dragged is None:
+            return
+        bar = self.main.list_scroll.verticalScrollBar()
+        viewport = self.main.list_scroll.viewport()
+        y = viewport.mapFromGlobal(QPoint(0, round(self._last_y))).y()
+        step = 0
+        if y < self.EDGE:
+            step = -self.SCROLL_STEP
+        elif y > viewport.height() - self.EDGE:
+            step = self.SCROLL_STEP
+        if step and bar.minimum() <= bar.value() + step <= bar.maximum():
+            bar.setValue(bar.value() + step)
+            self.drag_to(self._last_y)  # the list moved under the mouse
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if (
+            self.dragged is not None
+            and event.type() == QEvent.Type.KeyPress
+            and isinstance(event, QKeyEvent)
+            and event.key() == Qt.Key.Key_Escape
+        ):
+            self.end_drag(cancel=True)
+            return True
+        return False
 
 
 class MainWindow(QMainWindow):
@@ -170,6 +458,7 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(880, 540)
         self._build()
         frame.make_frameless(self)  # the title bar is drawn by the app (see TitleBar)
+        self._restore_geometry()
         theme.on_theme_changed(self._on_theme_changed)
         self._on_theme_changed(theme.mode())
 
@@ -179,11 +468,18 @@ class MainWindow(QMainWindow):
         controller.message.connect(self.show_message)
         controller.notified.connect(self._on_notified)
         controller.files_requested.connect(self._choose_files)
+        controller.dialog_requested.connect(self._show_page_dialog)
+        controller.backup_finished.connect(self._on_backup_finished)
+        controller.set_restore_tabs(settings.restore_tabs)
         controller.retry_available.connect(self.retry_button.setVisible)
         controller.shutdown_finished.connect(self._finish_close)
         QShortcut(QKeySequence("Ctrl+N"), self).activated.connect(self.new_profile)
         QShortcut(QKeySequence("Ctrl+,"), self).activated.connect(self.toggle_settings)
         QShortcut(QKeySequence("Ctrl+L"), self).activated.connect(self.toggle_logs)
+        QShortcut(QKeySequence("Ctrl+F"), self).activated.connect(self.focus_search)
+        self._opened_timer = QTimer(self)
+        self._opened_timer.timeout.connect(self._update_opened)
+        self._opened_timer.start(OPENED_REFRESH_MS)
 
         self._log_timer = QTimer(self)
         self._log_timer.timeout.connect(self._drain_logs)
@@ -195,6 +491,10 @@ class MainWindow(QMainWindow):
         self.release_checker.failed.connect(self.title_bar.release_unavailable)
         self.release_checker.failed.connect(self.settings_page.release_unavailable)
         self.release_checker.check()
+        self.update_downloader = UpdateDownloader(self)
+        self.update_downloader.progress.connect(self._on_update_progress)
+        self.update_downloader.finished.connect(self._on_update_downloaded)
+        self.update_downloader.failed.connect(self._on_update_failed)
 
     # --- layout -------------------------------------------------------------
     def _build(self) -> None:
@@ -231,29 +531,54 @@ class MainWindow(QMainWindow):
         self.new_button.setToolTip("New profile (Ctrl+N)")
         self.new_button.clicked.connect(self.new_profile)
         heading = make_label("Profiles", name="pageTitle")
+        self.search = QLineEdit()
+        self.search.setObjectName("profileSearch")
+        self.search.setPlaceholderText("Search")
+        self.search.setToolTip("Search by name, notes or device (Ctrl+F)")
+        self.search.setClearButtonEnabled(True)
+        self.search.setFixedWidth(200)
+        self.search.textChanged.connect(self._apply_filter)
+        self._search_icon = self.search.addAction(QIcon(), QLineEdit.ActionPosition.LeadingPosition)
         home.addLayout(
-            hbox(heading, 4, self.counter, None, self.close_all_button, self.open_all_button, self.new_button)
+            hbox(
+                heading,
+                4,
+                self.counter,
+                None,
+                self.search,
+                8,
+                self.close_all_button,
+                self.open_all_button,
+                self.new_button,
+            )
         )
         home.addSpacing(14)
 
-        self.list_widget = QWidget()
-        self.list_widget.setObjectName("profileList")
+        self.list_widget = ProfileList(self)
         self.list_layout = QVBoxLayout(self.list_widget)
         self.list_layout.setContentsMargins(0, 0, 6, 0)
         self.list_layout.setSpacing(10)
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        scroll.setWidget(self.list_widget)
-        home.addWidget(scroll, 1)
+        self.list_scroll = QScrollArea()
+        self.list_scroll.setWidgetResizable(True)
+        self.list_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.list_scroll.setWidget(self.list_widget)
+        home.addWidget(self.list_scroll, 1)
 
         # Settings page, in the same place.
-        self.settings_page = SettingsPage(self.settings.mode, self.settings.sounds)
+        self.settings_page = SettingsPage(self.settings.mode, self.settings.sounds, self.settings.restore_tabs)
         self.settings_page.back_requested.connect(self.show_home)
         self.settings_page.mode_changed.connect(self._on_mode_changed)
         self.settings_page.sounds_changed.connect(self._on_sounds_changed)
+        self.settings_page.restore_tabs_changed.connect(self._on_restore_tabs_changed)
+        self.settings_page.downloads_requested.connect(self.open_downloads_folder)
+        self.settings_page.export_requested.connect(self.export_profiles)
+        self.settings_page.update_requested.connect(self.ask_update)
+        self.settings_page.import_requested.connect(self.import_profiles)
         self.settings_page.data_folder_requested.connect(self.open_data_folder)
         self.settings_page.releases_requested.connect(self.title_bar.open_releases)
+        self.settings_page.repository_requested.connect(
+            lambda: QDesktopServices.openUrl(QUrl(f"https://github.com/{REPOSITORY}"))
+        )
         self.pages.addWidget(self.settings_page)
 
         root.addSpacing(8)
@@ -289,11 +614,24 @@ class MainWindow(QMainWindow):
 
     # --- list ---------------------------------------------------------------
     def refresh(self) -> None:
+        """Shows the profiles. If they are the same ones, in the same order, each card is only
+        updated (no flicker, and a card being dragged is not disturbed); otherwise the list is
+        built again."""
+        profiles = self.controller.profiles()
+        if self.cards and list(profiles) == list(self.cards):
+            for name, profile in profiles.items():
+                self.cards[name].update_profile(profile)
+            self._apply_filter()
+            self._update_toolbar()
+            return
+        self.list_widget.end_drag(cancel=True)
+        self._rebuild(profiles)
+
+    def _rebuild(self, profiles: dict[str, Profile]) -> None:
         while (item := self.list_layout.takeAt(0)) is not None:
             if (widget := item.widget()) is not None:
                 widget.deleteLater()
         self.cards.clear()
-        profiles = self.controller.profiles()
         if profiles:
             for profile in profiles.values():
                 card = ProfileCard(self, profile)
@@ -301,8 +639,55 @@ class MainWindow(QMainWindow):
                 self.list_layout.addWidget(card)
         else:
             self.list_layout.addWidget(self._empty_state())
+        self.no_match = make_label("No profiles match the search.", "muted")
+        self.no_match.setAlignment(Qt.AlignmentFlag.AlignHCenter)
+        self.list_layout.addSpacing(4)
+        self.list_layout.addWidget(self.no_match)
         self.list_layout.addStretch(1)
+        self._apply_filter()
         self._update_toolbar()
+
+    # --- search, reorder and time since opened ------------------------------
+    def focus_search(self) -> None:
+        self.show_home()
+        self.search.setFocus()
+        self.search.selectAll()
+
+    def _apply_filter(self) -> None:
+        """Shows only the profiles whose name, notes or summary (mode, device, browser...) contain
+        the search: what their cards show, plus the color of their label."""
+        query = self.search.text().strip().lower()
+        shown = 0
+        for card in self.cards.values():
+            profile = card.profile
+            summary = describe_profile(profile, self.controller.devices)
+            haystack = " ".join((profile.name, profile.notes, summary, profile.color)).lower()
+            visible = not query or query in haystack
+            card.setVisible(visible)
+            card.handle.setVisible(not query)  # the order is changed with the whole list in view
+            shown += visible
+        self.no_match.setVisible(bool(self.cards) and shown == 0)
+
+    def save_order(self) -> None:
+        """Keeps the order the cards were dragged into."""
+        names = [card.profile.name for card in self.list_widget.ordered_cards()]
+        if names != list(self.cards):
+            self.cards = {name: self.cards[name] for name in names}
+            self.controller.reorder(names)
+
+    def move_profile(self, name: str, before: str | None) -> None:
+        """Puts `name` right before `before` (or last) and saves the order."""
+        names = [n for n in self.cards if n != name]
+        if name not in self.cards:
+            return
+        names.insert(names.index(before) if before in names else len(names), name)
+        if names != list(self.cards):
+            self.controller.reorder(names)
+            self.refresh()
+
+    def _update_opened(self) -> None:
+        for card in self.cards.values():
+            card.update_opened()
 
     def _update_toolbar(self) -> None:
         total = len(self.cards)
@@ -336,9 +721,23 @@ class MainWindow(QMainWindow):
         else:
             self.status.setText(text)
 
-    def _on_notified(self, kind: str, _name: str, detail: str) -> None:
+    def _on_notified(self, kind: str, name: str, detail: str) -> None:
         """Shows a notification for an event; the name of the profile is never shown."""
         self.sound.play_for(kind)  # profiles created, edited or deleted, and browsers downloaded
+        if kind == "deleted":  # it can be brought back for a few seconds
+            toast = self.toasts.show(
+                kind,
+                "Profile deleted",
+                detail,
+                action=("Undo", lambda: self.controller.undo_delete(name)),
+                duration=UNDO_MS,
+            )
+
+            def finished(_toast: object) -> None:  # "Undo" was not pressed: deleted for good
+                self.controller.finish_delete(name)
+
+            toast.finished.connect(finished)
+            return
         if kind in EVENT_TEXTS:
             title, plural = EVENT_TEXTS[kind]
             self.toasts.show(kind, title, detail, group=kind, plural=plural)
@@ -435,6 +834,12 @@ class MainWindow(QMainWindow):
         log.info("Notification sounds: %s", "on" if enabled else "off")
         self._save_settings()
 
+    def _on_restore_tabs_changed(self, enabled: bool) -> None:
+        self.controller.set_restore_tabs(enabled)
+        self.settings.restore_tabs = enabled
+        log.info("Reopen the last tabs: %s", "on" if enabled else "off")
+        self._save_settings()
+
     def _save_settings(self) -> None:
         try:
             save_settings(self.settings)
@@ -444,6 +849,7 @@ class MainWindow(QMainWindow):
 
     def _on_theme_changed(self, _theme: str) -> None:
         frame.set_border_color(self, theme.color("border"))
+        self._search_icon.setIcon(QIcon(line_icons.pixmap("search", theme.color("muted"), 14)))
 
     def changeEvent(self, event: QEvent) -> None:
         if event.type() == QEvent.Type.WindowStateChange:
@@ -505,10 +911,90 @@ class MainWindow(QMainWindow):
         if self.controller.state_of(name) != CLOSED:
             self.controller.delete_profile(name)  # shows why it cannot be deleted
             return
-        message = f'"{name}" will be deleted together with its session and data. This cannot be undone.'
+        message = (
+            f'"{name}" will be deleted for good together with its session and data. You can undo it for a few seconds.'
+        )
         dialog = self._show_dialog(lambda: ConfirmDialog("Delete profile", message, "Delete", parent=self))
         if dialog is not None:
             dialog.accepted.connect(lambda: self.controller.delete_profile(name))
+
+    def _show_page_dialog(self, kind: str, message: str, default: str, site: str, future: DialogFuture) -> None:
+        """A page's alert or question, in front of the browser; the answer goes back to the page."""
+        dialog = PageDialog(kind, message, default, site)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+
+        def finished(_result: int) -> None:
+            if not future.done():
+                future.set_result(dialog.answer())
+
+        dialog.finished.connect(finished)
+        dialog.show_in_front()
+
+    # --- updating ------------------------------------------------------------
+    def ask_update(self, tag: str) -> None:
+        if self.update_downloader.running:
+            return
+        message = (
+            f"OpenProfiles will download {tag}, close the profiles (saving their sessions), "
+            "replace itself and open again."
+        )
+        dialog = self._show_dialog(
+            lambda: ConfirmDialog(f"Update to {tag}", message, "Update", parent=self, variant="primary")
+        )
+        if dialog is not None:
+            dialog.accepted.connect(self._start_update)
+
+    def _start_update(self) -> None:
+        log.info("Downloading the update")
+        self.status.setText("Downloading the update…")
+        self.update_downloader.start()
+
+    def _on_update_progress(self, done: int, total: int) -> None:
+        if total:
+            self.status.setText(f"Downloading the update… {done * 100 // total} %")
+
+    def _on_update_downloaded(self, path: str) -> None:
+        self.status.setText("Installing the update…")
+        try:
+            updater.install_update(Path(path))
+        except OSError as e:
+            self._on_update_failed(f"Could not start the update: {e}")
+            return
+        self.quit_app()  # the profiles close and save their sessions; then the new version opens
+
+    def _on_update_failed(self, error: str) -> None:
+        self.status.setText("")
+        self.toasts.show("error", "Could not update", error)
+
+    def export_profiles(self) -> None:
+        if self.controller.states:
+            self.toasts.show("warning", "Close the profiles before exporting them.")
+            return
+        default = str(browser_session.downloads_folder() / f"OpenProfiles-{datetime.now():%Y%m%d-%H%M}.zip")
+        path, _filter = QFileDialog.getSaveFileName(self, "Export profiles", default, "OpenProfiles backup (*.zip)")
+        if path:
+            self.controller.export_profiles(path)
+
+    def import_profiles(self) -> None:
+        path, _filter = QFileDialog.getOpenFileName(
+            self, "Import profiles", str(browser_session.downloads_folder()), "OpenProfiles backup (*.zip)"
+        )
+        if path:
+            self.controller.import_profiles(path)
+
+    def _on_backup_finished(self, kind: str, title: str, detail: str) -> None:
+        self.status.setText("")
+        self.toasts.show(kind, title, detail)
+        if kind == "created":
+            self.refresh()
+
+    def open_downloads_folder(self) -> None:
+        folder = browser_session.downloads_folder()
+        if QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder))):
+            log.info("Opened the Downloads folder: %s", folder)
+        else:
+            log.error("Could not open the Downloads folder: %s", folder)
+            self.toasts.show("error", "Could not open the Downloads folder", str(folder))
 
     def _choose_files(self, multiple: bool, accept: str, future: FilesFuture) -> None:
         """File chooser requested by a page in WebKit (see launcher.py). The page is in the
@@ -554,7 +1040,7 @@ class MainWindow(QMainWindow):
     def show_logs(self) -> None:
         # Created on first use; afterwards it is only hidden and shown again.
         if self.log_window is None:
-            self.log_window = LogWindow(self.log_handler)
+            self.log_window = LogWindow(self.log_handler, lambda: diagnostics.report(self.settings, self.log_handler))
             self.log_window.visibility_changed.connect(self._on_logs_visibility)
         self._unseen_problems = 0
         self.log_window.show_near(self)
@@ -594,7 +1080,23 @@ class MainWindow(QMainWindow):
             event.accept()
             return
         event.ignore()
+        self._save_geometry()
         self.controller.shutdown()  # disables the buttons through ready_changed
+
+    def quit_app(self) -> None:
+        """Closes the app (after an update is downloaded, for example)."""
+        self.close()
+
+    # --- window place -------------------------------------------------------
+    def _restore_geometry(self) -> None:
+        if self.settings.window:
+            self.restoreGeometry(QByteArray.fromBase64(self.settings.window.encode("ascii")))
+
+    def _save_geometry(self) -> None:
+        geometry = bytes(self.saveGeometry().toBase64().data()).decode("ascii")
+        if geometry != self.settings.window:
+            self.settings.window = geometry
+            self._save_settings()
 
     def _finish_close(self) -> None:
         self._can_close = True

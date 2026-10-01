@@ -1,5 +1,5 @@
-# Builds the portable OpenProfiles.exe with build.bat whenever a release is
-# published, and attaches it (with its SHA-256 checksum) to that release.
+# Runs the tests and builds the portable OpenProfiles.exe with build.bat whenever a
+# release is published, and attaches it (with its SHA-256 checksum) to that release.
 # It can also be run by hand from the Actions tab to test the build: the files
 # are then kept as a downloadable artifact of that run instead.
 
@@ -29,6 +29,10 @@ jobs:
           python -m venv .venv || exit /b 1
           .venv\Scripts\python.exe -m pip install --upgrade pip || exit /b 1
           .venv\Scripts\python.exe -m pip install -r requirements.txt pyinstaller || exit /b 1
+
+      - name: Run the tests
+        shell: cmd
+        run: .venv\Scripts\python.exe -m unittest discover -s tests -t . -v
 
       - name: Build dist\OpenProfiles.exe
         shell: cmd

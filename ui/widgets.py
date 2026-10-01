@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import QEasingCurve, QEvent, QPointF, QRectF, QSize, Qt, QVariantAnimation, Signal
-from PySide6.QtGui import QFocusEvent, QFont, QFontMetrics, QKeyEvent, QMouseEvent, QPainter, QPaintEvent, QPen
+from PySide6.QtGui import QColor, QFocusEvent, QFont, QFontMetrics, QKeyEvent, QMouseEvent, QPainter, QPaintEvent, QPen
 from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QSizePolicy, QWidget
 
 from ui import theme
@@ -230,6 +230,113 @@ class StatusDot(QWidget):
         key = self._state if self._state in ("opened", "closed") else "opening"
         painter.setBrush(theme.color(key))
         painter.drawEllipse(QRectF(0, 0, self.width(), self.height()))
+
+
+class ColorPicker(QWidget):
+    """A row of color swatches for a profile's label; the first one means no label."""
+
+    changed = Signal(str)
+    SWATCH = 20
+    GAP = 10
+
+    def __init__(self, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.options = ["", *theme.LABEL_COLORS]
+        self._index = 0
+        self._hover = -1
+        self.setMouseTracking(True)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.setFixedSize(len(self.options) * (self.SWATCH + self.GAP) - self.GAP + 8, 36)
+
+    def value(self) -> str:
+        return self.options[self._index]
+
+    def set_value(self, color: str) -> None:
+        self._index = self.options.index(color) if color in self.options else 0
+        self.update()
+
+    def _rect(self, index: int) -> QRectF:
+        top = (self.height() - self.SWATCH) / 2
+        return QRectF(4 + index * (self.SWATCH + self.GAP), top, self.SWATCH, self.SWATCH)
+
+    def _index_at(self, x: float) -> int:
+        for index in range(len(self.options)):
+            rect = self._rect(index).adjusted(-self.GAP / 2, 0, self.GAP / 2, 0)
+            if rect.left() <= x < rect.right():
+                return index
+        return -1
+
+    def _select(self, index: int) -> None:
+        if 0 <= index < len(self.options) and index != self._index:
+            self._index = index
+            self.update()
+            self.changed.emit(self.value())
+
+    def paintEvent(self, _event: QPaintEvent) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        for index, color in enumerate(self.options):
+            rect = self._rect(index)
+            if index == self._index or index == self._hover:
+                ring = theme.color("text") if index == self._index else theme.color("ring")
+                painter.setPen(QPen(ring, 1.5))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawEllipse(rect.adjusted(-3.5, -3.5, 3.5, 3.5))
+            if color:
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.setBrush(QColor(theme.LABEL_COLORS[color]))
+                painter.drawEllipse(rect)
+            else:  # no label: an empty circle crossed out
+                painter.setPen(QPen(theme.color("muted"), 1.5))
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+                painter.drawEllipse(rect.adjusted(1, 1, -1, -1))
+                painter.drawLine(rect.bottomLeft() + QPointF(4, -4), rect.topRight() + QPointF(-4, 4))
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._select(self._index_at(event.position().x()))
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        hover = self._index_at(event.position().x())
+        if hover != self._hover:
+            self._hover = hover
+            self.setToolTip((self.options[hover] or "No label").capitalize() if hover >= 0 else "")
+            self.update()
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event: QEvent) -> None:
+        self._hover = -1
+        self.update()
+        super().leaveEvent(event)
+
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        if event.key() in (Qt.Key.Key_Left, Qt.Key.Key_Up):
+            self._select(self._index - 1)
+        elif event.key() in (Qt.Key.Key_Right, Qt.Key.Key_Down):
+            self._select(self._index + 1)
+        else:
+            super().keyPressEvent(event)
+
+
+class ColorTag(QWidget):
+    """The colored bar at the left of a profile card (empty without a label)."""
+
+    def __init__(self, color: str, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.color = color
+        self.setFixedWidth(4)
+
+    def paintEvent(self, _event: QPaintEvent) -> None:
+        if self.color in theme.LABEL_COLORS:
+            painter = QPainter(self)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(theme.LABEL_COLORS[self.color]))
+            painter.drawRoundedRect(QRectF(self.rect()), 2, 2)
 
 
 class ProfileCounter(QWidget):

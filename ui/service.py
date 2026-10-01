@@ -25,6 +25,8 @@ SHUTDOWN_SECONDS = 15  # time the profiles have to close and save their sessions
 
 # Future the interface resolves with the files picked in the chooser.
 FilesFuture = concurrent.futures.Future[list[str]]
+# Future the interface resolves with the answer to a page's dialog: (accepted, text).
+DialogFuture = concurrent.futures.Future[tuple[bool, str]]
 
 
 class ServiceSignals(QObject):
@@ -32,8 +34,10 @@ class ServiceSignals(QObject):
     installed = Signal()  # the browsers finished downloading (first run)
     info = Signal(str)
     failed = Signal(str)
-    state = Signal(str, str, str)  # profile name, state ("opened", "warning", "error", "closed", "done"), message
+    # profile name, state ("opened", "warning", "error", "saved", "closed", "done"), message
+    state = Signal(str, str, str)
     files = Signal(bool, str, object)  # multiple, accept, FilesFuture
+    dialog = Signal(str, str, str, str, object)  # kind, message, default text, site, DialogFuture
 
 
 class BrowserService:
@@ -49,6 +53,7 @@ class BrowserService:
         self.contexts: dict[str, BrowserContext] = {}
         self.tasks: dict[str, asyncio.Task[None]] = {}
         self.stopping = False  # set by stop(): nothing new opens, and a running download is cancelled
+        self.restore_tabs = True  # reopen the tabs of the last session (a setting)
 
     # --- service thread -----------------------------------------------------
     def start(self) -> None:
@@ -124,6 +129,11 @@ class BrowserService:
         self.signals.files.emit(multiple, accept, future)
         return await asyncio.wrap_future(future)
 
+    async def _ask(self, kind: str, message: str, default: str, site: str) -> tuple[bool, str]:
+        future: DialogFuture = concurrent.futures.Future()
+        self.signals.dialog.emit(kind, message, default, site, future)
+        return await asyncio.wrap_future(future)
+
     async def _run_profile(self, profile: Profile) -> None:
         try:
             if self.pw is None:
@@ -141,6 +151,8 @@ class BrowserService:
                 notify=self._notify,
                 contexts=self.contexts,
                 choose_files=self._choose_files,
+                ask=self._ask,
+                restore_tabs=self.restore_tabs,
             )
         except Exception as e:  # shown in the interface
             log.exception("Unexpected error in '%s'", profile.name)

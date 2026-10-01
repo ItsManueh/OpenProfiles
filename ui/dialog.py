@@ -1,13 +1,14 @@
 """
 Dialogs without the Windows frame: a card with its own header (title, optional
 subtitle and a close button) that keeps the native shadow and rounded corners,
-moves by dragging any empty part of it, and dims the window behind it.
+opens centered on the window (it grows and shrinks from its center), moves by
+dragging any empty part of it, and dims the window behind it.
 """
 
 from __future__ import annotations
 
-from PySide6.QtCore import Property, QByteArray, QEvent, QObject, QPropertyAnimation, Qt
-from PySide6.QtGui import QColor, QMouseEvent, QPainter, QPaintEvent, QShowEvent
+from PySide6.QtCore import Property, QByteArray, QEvent, QObject, QPoint, QPropertyAnimation, QRect, Qt
+from PySide6.QtGui import QColor, QCursor, QGuiApplication, QMouseEvent, QPainter, QPaintEvent, QResizeEvent, QShowEvent
 from PySide6.QtWidgets import QDialog, QHBoxLayout, QLayout, QVBoxLayout, QWidget
 
 from ui import frame, theme
@@ -27,6 +28,7 @@ class Dialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle(title)
         frame.make_frameless(self, resizable=False)
+        self._placed = False  # centered once it has its final size
 
         self.close_button = IconButton("x", "Close (Esc)", size=(30, 30), icon_size=16)
         self.close_button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -58,6 +60,35 @@ class Dialog(QDialog):
     def showEvent(self, event: QShowEvent) -> None:
         frame.set_border_color(self, theme.color("border_strong"))
         super().showEvent(event)
+        if not self._placed:
+            self.adjustSize()  # the final size, before placing it
+            self.move(self._centered_position())
+            self._placed = True
+
+    def _centered_position(self) -> QPoint:
+        """Centered on the app's window (or on the screen under the mouse), inside the screen."""
+        parent = self.parentWidget()
+        if parent is not None and parent.window().isVisible():
+            anchor = parent.window().frameGeometry().center()
+        else:
+            anchor = QCursor.pos()
+        screen = QGuiApplication.screenAt(anchor) or QGuiApplication.primaryScreen()
+        area = screen.availableGeometry()
+        if parent is None:
+            anchor = area.center()
+        box = QRect(QPoint(0, 0), self.frameSize())
+        box.moveCenter(anchor)
+        x = min(max(box.left(), area.left()), area.right() - box.width())
+        y = min(max(box.top(), area.top()), area.bottom() - box.height())
+        return QPoint(x, y)
+
+    def resizeEvent(self, event: QResizeEvent) -> None:
+        # Showing or hiding fields changes the size: keep the same center.
+        old = event.oldSize()
+        if self._placed and self.isVisible() and old.isValid():
+            delta = event.size() - old
+            self.move(self.x() - delta.width() // 2, self.y() - delta.height() // 2)
+        super().resizeEvent(event)
 
     def event(self, event: QEvent) -> bool:
         if event.type() == QEvent.Type.StyleChange and self.isVisible():

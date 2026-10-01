@@ -1,4 +1,4 @@
-"""App settings (appearance mode and notification sounds), saved in settings.json in the data folder."""
+"""App settings (appearance, sounds, tabs and the window's place), saved in settings.json in the data folder."""
 
 from __future__ import annotations
 
@@ -19,6 +19,8 @@ APPEARANCE_MODES = ("auto", "light", "dark")  # auto follows the Windows theme
 class Settings:
     mode: str = "auto"  # follows Windows: dark when Windows uses dark mode
     sounds: bool = True  # notification sound
+    restore_tabs: bool = True  # profiles reopen the tabs of their last session
+    window: str = ""  # size and position of the window (Qt's saveGeometry, in base64)
 
 
 def load_settings() -> Settings:
@@ -37,11 +39,12 @@ def load_settings() -> Settings:
         settings.mode = mode
     elif mode is not None:
         log.warning("Ignoring the unknown appearance mode %r in %s", mode, SETTINGS_FILE.name)
-    sounds = values.get("sounds")
-    if isinstance(sounds, bool):
-        settings.sounds = sounds
-    elif sounds is not None:
-        log.warning("Ignoring the invalid value %r of sounds in %s", sounds, SETTINGS_FILE.name)
+    for key, kind in (("sounds", bool), ("restore_tabs", bool), ("window", str)):
+        value = values.get(key)
+        if isinstance(value, kind):
+            setattr(settings, key, value)
+        elif value is not None:
+            log.warning("Ignoring the invalid value %r of %s in %s", value, key, SETTINGS_FILE.name)
     return settings
 
 

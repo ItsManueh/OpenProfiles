@@ -81,6 +81,27 @@ ICONS = {
         '<path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>'
     ),
     "search": '<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>',
+    "sliders": (
+        '<path d="M21 4h-7"/><path d="M10 4H3"/><path d="M21 12h-9"/><path d="M8 12H3"/><path d="M21 20h-5"/>'
+        '<path d="M12 20H3"/><path d="M14 2v4"/><path d="M8 10v4"/><path d="M16 18v4"/>'
+    ),
+    "globe": (
+        '<circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/>'
+        '<path d="M2 12h20"/>'
+    ),
+    "archive": (
+        '<rect width="20" height="5" x="2" y="3" rx="1"/><path d="M4 8v11a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8"/>'
+        '<path d="M10 12h4"/>'
+    ),
+    # Pieces of icons that move on their own (see AnimatedIconButton in icons.py).
+    "trash-lid": '<path d="M3 6h18"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/>',
+    "trash-can": '<path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M10 11v6"/><path d="M14 11v6"/>',
+    "copy-front": '<rect width="14" height="14" x="8" y="8" rx="2" ry="2"/>',
+    "copy-back": '<path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/>',
+    "grip": (
+        '<circle cx="9" cy="12" r="1"/><circle cx="9" cy="5" r="1"/><circle cx="9" cy="19" r="1"/>'
+        '<circle cx="15" cy="12" r="1"/><circle cx="15" cy="5" r="1"/><circle cx="15" cy="19" r="1"/>'
+    ),
 }
 STROKE = 2.0  # line width in the 24x24 grid of the icons
 PIXMAP_RATIO = 3  # pixmaps are drawn larger so they stay sharp on high-DPI screens

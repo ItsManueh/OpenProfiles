@@ -8,6 +8,7 @@ Graphical interface built with PySide6 (Qt).
 - frame.py           frameless windows with the native shadow, corners and behavior
 - title_bar.py       title bar of the main window
 - dialog.py          base of the dialogs (no Windows frame) and the backdrop behind them
+- page_dialog.py     the alerts, confirmations and prompts of the web pages
 - toast.py           notifications
 - sound.py           notification sound
 - service.py         BrowserService: Playwright in its own thread, talking through Qt signals

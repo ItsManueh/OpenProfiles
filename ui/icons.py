@@ -125,7 +125,12 @@ def draw_glyph(painter: QPainter, center: QPointF, glyph: str, size: int, color:
 
 
 class IconButton(AnimatedIconButton):
-    """A line icon with a tooltip; `danger` turns it red on hover (delete)."""
+    """A line icon with a tooltip; `danger` turns it red on hover (delete).
+
+    The icons of the profile cards move on hover: the pencil tilts as if to write,
+    the two sheets of "duplicate" slide apart, and the lid of the trash lifts."""
+
+    ANIMATED: ClassVar[frozenset[str]] = frozenset({"pencil", "copy", "trash"})
 
     def __init__(
         self,
@@ -137,13 +142,40 @@ class IconButton(AnimatedIconButton):
         danger: bool = False,
         parent: QWidget | None = None,
     ):
-        super().__init__(tooltip, size=size, duration=160, parent=parent)
+        animated = icon in self.ANIMATED
+        super().__init__(tooltip, size=size, duration=260 if animated else 160, parent=parent)
+        if animated:
+            self._animation.setEasingCurve(QEasingCurve.Type.OutBack)  # a little bounce at the end
         self.icon_name = icon
         self.icon_size = icon_size
         self.danger = danger
 
     def paint_icon(self, painter: QPainter, center: QPointF, color: QColor) -> None:
-        line_icons.paint(painter, self.icon_name, _square(center, self.icon_size), color)
+        rect = _square(center, self.icon_size)
+        progress = self._progress
+        unit = rect.width() / 24  # the icons are drawn on a 24x24 grid
+        if self.icon_name == "pencil" and progress:
+            painter.save()
+            painter.translate(center + QPointF(unit * progress, -unit * progress))
+            painter.rotate(-14 * progress)
+            painter.translate(-center)
+            line_icons.paint(painter, "pencil", rect, color)
+            painter.restore()
+        elif self.icon_name == "copy" and progress:
+            shift = 1.6 * unit * progress
+            line_icons.paint(painter, "copy-back", rect.translated(-shift, -shift), color)
+            line_icons.paint(painter, "copy-front", rect.translated(shift, shift), color)
+        elif self.icon_name == "trash" and progress:
+            line_icons.paint(painter, "trash-can", rect, color)
+            hinge = QPointF(rect.left() + 3 * unit, rect.top() + 6 * unit)  # left end of the lid
+            painter.save()
+            painter.translate(hinge + QPointF(0, -2.2 * unit * progress))
+            painter.rotate(-16 * progress)
+            painter.translate(-hinge)
+            line_icons.paint(painter, "trash-lid", rect, color)
+            painter.restore()
+        else:
+            line_icons.paint(painter, self.icon_name, rect, color)
 
 
 class GearButton(AnimatedIconButton):

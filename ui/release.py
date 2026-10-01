@@ -1,4 +1,4 @@
-"""Asks GitHub for the latest release in the background, without blocking the interface."""
+"""Asks GitHub for the latest release, and downloads an update, in the background."""
 
 from __future__ import annotations
 
@@ -11,6 +11,7 @@ from typing import cast
 
 from PySide6.QtCore import QObject, Signal, SignalInstance
 
+import updater
 from about import APP_NAME, APP_VERSION, LATEST_RELEASE_API, RELEASES_URL
 
 log = logging.getLogger("app.gui")
@@ -56,3 +57,31 @@ class ReleaseChecker(QObject):
     def _emit(signal: SignalInstance, *args: str) -> None:
         with contextlib.suppress(RuntimeError):  # the app closed while GitHub was answering
             signal.emit(*args)
+
+
+class UpdateDownloader(QObject):
+    """Downloads and checks the new .exe in a thread (see updater.py)."""
+
+    progress = Signal(int, int)  # bytes done, total
+    finished = Signal(str)  # path of the checked .exe
+    failed = Signal(str)
+
+    def __init__(self, parent: QObject | None = None):
+        super().__init__(parent)
+        self.running = False
+
+    def start(self) -> None:
+        if not self.running:
+            self.running = True
+            threading.Thread(target=self._run, name="update", daemon=True).start()
+
+    def _run(self) -> None:
+        try:
+            path = updater.download_update(lambda done, total: self.progress.emit(done, total))
+        except updater.UpdateError as e:
+            log.warning("Could not update: %s", e)
+            self.failed.emit(str(e))
+        else:
+            self.finished.emit(str(path))
+        finally:
+            self.running = False

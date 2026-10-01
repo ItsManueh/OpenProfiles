@@ -3,6 +3,6 @@
   "venv": ".venv",
   "pythonVersion": "3.13",
   "typeCheckingMode": "standard",
-  "include": ["*.py", "ui"],
+  "include": ["*.py", "ui", "tests"],
   "exclude": [".venv", "browsers", "data", "dist", "build", "fonts", "assets"]
 }

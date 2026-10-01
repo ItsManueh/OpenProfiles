@@ -97,6 +97,16 @@ SHADOW_ALPHA = {"dark": 0.55, "light": 0.10}  # notification shadow ("shadow-lg"
 
 # Log colors that read well on both themes (the text of the logs keeps them when the theme changes).
 LOG_COLORS = {"debug": "#8b8b94", "warning": "#d97706", "error": "#ef4444"}
+# Labels a profile can have (Tailwind's 500 shades, readable on both themes).
+LABEL_COLORS = {
+    "red": "#ef4444",
+    "orange": "#f97316",
+    "yellow": "#eab308",
+    "green": "#22c55e",
+    "blue": "#3b82f6",
+    "purple": "#a855f7",
+    "pink": "#ec4899",
+}
 LOG_TONE_COLORS = {
     "success": "#16a34a",
     "info": "#2563eb",
@@ -122,6 +132,7 @@ EVENTS: dict[str, tuple[str, str]] = {
     "opened": ("circle-play", "info"),
     "closed": ("power", "neutral"),
     "downloaded": ("download", "success"),
+    "file": ("download", "success"),
     "folder": ("folder", "neutral"),
     "copied": ("copy", "neutral"),
     "saved": ("save", "success"),
@@ -231,7 +242,9 @@ def _toast_rules(theme: str) -> str:
         rules.append(
             f'QFrame#toast[tone="{tone}"] {{ background: {background}; border: 1px solid {border}; }}\n'
             f'QFrame#toast[tone="{tone}"] QLabel#toastTitle {{ color: {title}; }}\n'
-            f'QFrame#toast[tone="{tone}"] QLabel#toastDetail {{ color: {detail}; }}'
+            f'QFrame#toast[tone="{tone}"] QLabel#toastDetail {{ color: {detail}; }}\n'
+            f'QFrame#toast[tone="{tone}"] QPushButton#toastAction {{ color: {title}; border: 1px solid {border}; }}\n'
+            f'QFrame#toast[tone="{tone}"] QPushButton#toastAction:hover {{ background: {border}; }}'
         )
     return "\n".join(rules)
 
@@ -248,6 +261,10 @@ def stylesheet(theme: str) -> str:
     QToolTip {{
         background: {c["surface"]}; color: {c["text"]}; border: 1px solid {c["border"]}; padding: 5px 8px;
     }}
+    QMenu {{ background: {c["surface"]}; color: {c["text"]}; border: 1px solid {c["border"]}; padding: 4px; }}
+    QMenu::item {{ padding: 6px 18px; border-radius: 6px; }}
+    QMenu::item:selected {{ background: {c["surface_hover"]}; }}
+    QMenu::separator {{ height: 1px; background: {c["border"]}; margin: 4px 6px; }}
 
     QLabel#title {{ font-size: 28px; font-weight: 700; }}
     QLabel#dialogTitle, QLabel#pageTitle {{ font-size: 22px; font-weight: 700; }}
@@ -264,12 +281,18 @@ def stylesheet(theme: str) -> str:
 
     QFrame#card {{ background: {c["surface"]}; border: 1px solid {c["border"]}; border-radius: 12px; }}
     QFrame#card:hover {{ border-color: {c["border_strong"]}; }}
+    QFrame#card[dragging="true"] {{ border-color: {c["accent"]}; background: {c["surface_hover"]}; }}
+    QFrame#dropSlot {{ border: 1px dashed {c["border_strong"]}; border-radius: 12px; background: transparent; }}
     QFrame#card QLabel {{ background: transparent; }}
 
     QFrame#toast {{ border-radius: 10px; }}
     QFrame#toast QLabel, QFrame#toast QWidget {{ background: transparent; }}
     QLabel#toastTitle {{ font-family: "{FONTS.mono}"; font-size: 13px; font-weight: 500; }}
     QLabel#toastDetail {{ font-family: "{FONTS.mono}"; font-size: 12px; }}
+    QPushButton#toastAction {{
+        min-height: 28px; max-height: 28px; padding: 0 8px; border-radius: 6px; background: transparent;
+        font-family: "{FONTS.mono}"; font-size: 12px; font-weight: 600;
+    }}
     {_toast_rules(theme)}
 
     QPushButton {{
@@ -329,6 +352,8 @@ def stylesheet(theme: str) -> str:
     }}
 
     QLabel#sectionTitle {{ color: {c["muted"]}; font-size: 12px; font-weight: 600; letter-spacing: 0.6px; }}
+    QLabel#tabTitle {{ font-size: 18px; font-weight: 600; }}
+    QLabel#windowTitle {{ font-size: 13px; font-weight: 600; color: {c["muted"]}; }}
     QFrame#settingsGroup {{ background: {c["surface"]}; border: 1px solid {c["border"]}; border-radius: 12px; }}
     QFrame#settingsGroup QLabel {{ background: transparent; }}
     QFrame#settingsDivider {{ background: {c["border"]}; border: none; min-height: 1px; max-height: 1px; }}

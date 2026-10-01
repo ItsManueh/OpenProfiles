@@ -8,11 +8,15 @@ from __future__ import annotations
 
 import logging
 import threading
+from collections.abc import Callable
+from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
 
+import backup
 import launcher
-from profiles import Devices, Profile, ProfileError, create_profile, delete_profile, load_profiles, update_profile
+import profiles as storage
+from profiles import Devices, Profile, ProfileError, create_profile, load_profiles, update_profile
 from ui.service import BrowserService
 
 log = logging.getLogger("app.gui")
@@ -28,7 +32,9 @@ class AppController(QObject):
     message = Signal(str, bool)  # progress text for the status bar, or an error (shown as a notification)
     notified = Signal(str, str, str)  # event kind (created, opened, error...), profile name, detail
     files_requested = Signal(bool, str, object)  # multiple, accept, future to resolve with the paths
+    dialog_requested = Signal(str, str, str, str, object)  # a page's alert or question (see PageDialog)
     retry_available = Signal(bool)  # the browser engine could not start: it can be started again
+    backup_finished = Signal(str, str, str)  # kind of notification, title, detail (from a worker thread)
     shutdown_finished = Signal()
 
     def __init__(self) -> None:
@@ -37,6 +43,9 @@ class AppController(QObject):
         self.states: dict[str, str] = {}
         self.closing = False
         self._load_error = ""  # last error reading profiles.json, reported once
+        self.restore_tabs = True  # reopen the tabs of the last session (a setting)
+        self._deleted: dict[str, storage.DeletedProfile] = {}  # deleted profiles that can still be restored
+        self.backup_running = False
         self.service = self._create_service()
 
     def _create_service(self) -> BrowserService:
@@ -48,7 +57,14 @@ class AppController(QObject):
         signals.failed.connect(self._on_failed)
         signals.state.connect(self._on_state)
         signals.files.connect(self.files_requested)
+        signals.dialog.connect(self.dialog_requested)
+        service.restore_tabs = self.restore_tabs
         return service
+
+    def set_restore_tabs(self, enabled: bool) -> None:
+        """Applies to the profiles opened from now on."""
+        self.restore_tabs = enabled
+        self.service.restore_tabs = enabled
 
     def start(self) -> None:
         """Starts the browser engine; after a failure (no connection on the first download,
@@ -58,6 +74,8 @@ class AppController(QObject):
         if self.service.thread.ident is not None:  # this one already ran and failed
             log.info("Starting the browser engine again")
             self.service = self._create_service()
+        else:  # first start: what an earlier session left in the trash is deleted for good
+            threading.Thread(target=storage.empty_trash, name="empty-trash", daemon=True).start()
         self.retry_available.emit(False)
         self.message.emit("Preparing browsers…", False)
         self.service.start()
@@ -113,18 +131,111 @@ class AppController(QObject):
         return saved
 
     def delete_profile(self, name: str) -> None:
+        """Deletes a profile; undo_delete() brings it back until finish_delete() is called (the
+        notification with "Undo" closes), which deletes its data for good."""
         if name in self.states:
             log.warning("Tried to delete '%s' while it is open", name)
             self.notified.emit("warning", name, "Close the profile before deleting it.")
             return
         try:
-            delete_profile(name)
+            self._deleted[name] = storage.delete_profile(name, undoable=True)
         except (ProfileError, OSError) as e:
             log.warning("Could not delete '%s': %s", name, e)
             self.notified.emit("error", name, "Could not delete the profile. The details are in the logs.")
             return
         self.profiles_changed.emit()
-        self.notified.emit("deleted", name, "Session and data removed")
+        self.notified.emit("deleted", name, "With its session and data")
+
+    def undo_delete(self, name: str) -> None:
+        deleted = self._deleted.pop(name, None)
+        if deleted is None:
+            return
+        try:
+            storage.restore_profile(deleted)
+        except ProfileError as e:
+            log.warning("Could not restore '%s': %s", name, e)
+            self.notified.emit("error", name, "Could not restore the profile. The details are in the logs.")
+            storage.purge(deleted)
+            return
+        self.profiles_changed.emit()
+        self.notified.emit("restored", name, "With its session and data")
+
+    def finish_delete(self, name: str) -> None:
+        """The deletion can no longer be undone: its data is deleted for good (in the background)."""
+        deleted = self._deleted.pop(name, None)
+        if deleted is not None:
+            threading.Thread(target=storage.purge, args=(deleted,), name="purge", daemon=True).start()
+
+    def duplicate_profile(self, name: str) -> None:
+        """A copy of the settings, with its own fingerprint and no session."""
+        if not self.ready:
+            return
+        try:
+            copy = storage.duplicate_profile(name, self.iphones)
+        except (ProfileError, OSError) as e:
+            log.warning("Could not duplicate '%s': %s", name, e)
+            self.notified.emit("error", name, "Could not duplicate the profile. The details are in the logs.")
+            return
+        log.info("Duplicated '%s' as '%s'", name, copy.name)
+        self.profiles_changed.emit()
+        self.notified.emit("created", copy.name, "Duplicate with its own fingerprint")
+
+    # --- backups ------------------------------------------------------------
+    def export_profiles(self, path: str) -> None:
+        """Writes every profile to a .zip in the background; they must be closed."""
+        if self.backup_running:
+            return
+        if self.states:
+            self.notified.emit("warning", "", "Close the profiles before exporting them.")
+            return
+        self._run_backup(lambda: self._export(path))
+
+    def import_profiles(self, path: str) -> None:
+        if not self.backup_running:
+            self._run_backup(lambda: self._import(path))
+
+    def _run_backup(self, work: Callable[[], None]) -> None:
+        self.backup_running = True
+        self.message.emit("Working on the backup…", False)
+
+        def run() -> None:
+            try:
+                work()
+            finally:
+                self.backup_running = False
+
+        threading.Thread(target=run, name="backup", daemon=True).start()
+
+    def _export(self, path: str) -> None:
+        try:
+            count, size = backup.export_profiles(Path(path))
+        except (ProfileError, OSError) as e:
+            log.error("Could not export the profiles: %s", e)
+            self.backup_finished.emit("error", "Could not export the profiles", str(e))
+            return
+        megabytes = f"{size / 1_048_576:.1f} MB"
+        self.backup_finished.emit(
+            "saved", "Profiles exported", f"{count} profile{'' if count == 1 else 's'} · {megabytes}"
+        )
+
+    def _import(self, path: str) -> None:
+        try:
+            names = backup.import_profiles(Path(path))
+        except (ProfileError, OSError) as e:
+            log.error("Could not import the profiles: %s", e)
+            self.backup_finished.emit("error", "Could not import the profiles", str(e))
+            return
+        count = len(names)
+        self.backup_finished.emit("created", "Profiles imported", f"{count} profile{'' if count == 1 else 's'} added")
+
+    def reorder(self, names: list[str]) -> None:
+        """Saves the order of the list (after dragging a profile); the list already shows it."""
+        try:
+            storage.reorder_profiles(names)
+        except (ProfileError, OSError) as e:
+            log.warning("Could not save the order of the profiles: %s", e)
+            self.notified.emit("error", "", "Could not save the order of the profiles.")
+            self.profiles_changed.emit()  # back to the saved order
 
     # --- opening and closing ------------------------------------------------
     def open_profile(self, name: str) -> None:
@@ -205,6 +316,14 @@ class AppController(QObject):
         if state == "opened":
             self._set_state(name, OPENED)
             self.notified.emit("opened", name, "")
+            try:
+                storage.mark_opened(name)
+            except (ProfileError, OSError) as e:
+                log.debug("Could not save when '%s' was opened: %s", name, e)
+            else:
+                self.profiles_changed.emit()  # its card shows when it was last opened
+        elif state == "saved":  # a download, kept in the Downloads folder
+            self.notified.emit("file", name, text)
         elif state in ("error", "warning"):
             if not self.closing:  # a page cut short because the app is closing is not a problem
                 self.notified.emit(state, name, text)

@@ -121,3 +121,50 @@ class TitleBar(QWidget):
             log.info("Opened the releases page: %s", self.release_url)
         else:
             log.error("Could not open the releases page: %s", self.release_url)
+
+
+class WindowHeader(QWidget):
+    """A slim title bar for the other windows of the app (the logs): its title on the left
+    and the window buttons on the right; drag it to move the window, double-click it to
+    maximize or restore it."""
+
+    def __init__(self, window: QWidget, title: str):
+        super().__init__(window)
+        self.window_ = window
+        self.setFixedHeight(CAPTION_HEIGHT)
+        self.minimize_button = WindowButton("minimize")
+        self.minimize_button.clicked.connect(window.showMinimized)
+        self.maximize_button = WindowButton("maximize")
+        self.maximize_button.clicked.connect(self.toggle_maximized)
+        self.close_button = WindowButton("close")
+        self.close_button.clicked.connect(window.close)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(16, 0, 0, 0)
+        layout.setSpacing(0)
+        layout.addWidget(make_label(title, name="windowTitle"))
+        layout.addStretch(1)
+        for button in (self.minimize_button, self.maximize_button, self.close_button):
+            layout.addWidget(button, 0, Qt.AlignmentFlag.AlignTop)
+
+    def toggle_maximized(self) -> None:
+        if self.window_.isMaximized():
+            self.window_.showNormal()
+        else:
+            self.window_.showMaximized()
+
+    def update_maximized(self) -> None:
+        self.maximize_button.set_maximized(self.window_.isMaximized())
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.window_.windowHandle().startSystemMove()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseDoubleClickEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.toggle_maximized()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)

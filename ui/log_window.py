@@ -11,14 +11,16 @@ from __future__ import annotations
 import logging
 import platform
 import time
+from collections.abc import Callable
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QCloseEvent, QColor, QFont, QGuiApplication, QIcon, QTextCharFormat, QTextCursor
+from PySide6.QtCore import QByteArray, QEvent, Qt, QTimer, Signal
+from PySide6.QtGui import QCloseEvent, QColor, QFont, QGuiApplication, QIcon, QShowEvent, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import QFileDialog, QLineEdit, QPlainTextEdit, QVBoxLayout, QWidget
 
 import logs
-from ui import line_icons, theme
+from ui import frame, line_icons, theme
+from ui.title_bar import WindowHeader
 from ui.toast import ToastHost
 from ui.widgets import SegmentedControl, hbox, make_button, make_label
 
@@ -85,8 +87,12 @@ class LogWindow(QWidget):
 
     visibility_changed = Signal(bool)
 
-    def __init__(self, handler: logs.PanelHandler, parent: QWidget | None = None):
+    def __init__(
+        self, handler: logs.PanelHandler, diagnostics: Callable[[], str] | None = None, parent: QWidget | None = None
+    ):
         super().__init__(parent, Qt.WindowType.Window)
+        self.diagnostics = diagnostics
+        self.header = WindowHeader(self, "Logs")
         self.setObjectName("LogWindow")
         self.setWindowTitle("Logs · OpenProfiles")
         self.setMinimumSize(680, 300)
@@ -120,6 +126,10 @@ class LogWindow(QWidget):
         save.clicked.connect(self.save)
         clear = make_button("Clear", small=True)
         clear.clicked.connect(self.clear)
+        report = make_button("Diagnostics", small=True)
+        report.setToolTip("Copy a summary to paste when reporting a problem")
+        report.clicked.connect(self.copy_diagnostics)
+        report.setVisible(diagnostics is not None)
 
         self.view = QPlainTextEdit()
         self.view.setObjectName("logView")
@@ -129,13 +139,19 @@ class LogWindow(QWidget):
         self.view.setFont(theme.mono_font(12))
         self.summary = make_label(role="small")
 
+        content = QVBoxLayout()
+        content.setContentsMargins(16, 4, 16, 10)
+        content.setSpacing(10)
+        content.addLayout(hbox(self.filter, self.search, None, report, 6, copy, save, clear, spacing=6))
+        content.addWidget(self.view, 1)
+        content.addWidget(self.summary)
         root = QVBoxLayout(self)
-        root.setContentsMargins(16, 14, 16, 10)
-        root.setSpacing(10)
-        root.addLayout(hbox(self.filter, self.search, None, copy, save, clear, spacing=6))
-        root.addWidget(self.view, 1)
-        root.addWidget(self.summary)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+        root.addWidget(self.header)
+        root.addLayout(content, 1)
         self.toasts = ToastHost(self, right=16, bottom=40)
+        frame.make_frameless(self)  # its own title bar, like the main window
         self._render()
 
     # --- window -------------------------------------------------------------
@@ -149,6 +165,25 @@ class LogWindow(QWidget):
         self.raise_()
         self.activateWindow()
         self.visibility_changed.emit(True)
+
+    def showEvent(self, event: QShowEvent) -> None:
+        frame.set_border_color(self, theme.color("border"))
+        super().showEvent(event)
+
+    def event(self, event: QEvent) -> bool:
+        if event.type() == QEvent.Type.StyleChange and self.isVisible():
+            frame.set_border_color(self, theme.color("border"))  # the theme changed
+        elif event.type() == QEvent.Type.WindowStateChange:
+            self.header.update_maximized()
+        return super().event(event)
+
+    def nativeEvent(self, eventType: QByteArray | bytes | bytearray | memoryview, message: int) -> object:
+        name = eventType.data() if isinstance(eventType, QByteArray) else bytes(eventType)
+        if name == b"windows_generic_MSG":
+            result = frame.handle_message(self, int(message))
+            if result is not None:
+                return True, result
+        return super().nativeEvent(eventType, message)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         event.ignore()
@@ -220,6 +255,12 @@ class LogWindow(QWidget):
         lines = [entry.line for entry in self.handler.records(self.min_level, self.query)]
         QGuiApplication.clipboard().setText("\n".join(lines))
         self.toasts.show("copied", "Copied to the clipboard", _plural(len(lines), "line", "lines"))
+
+    def copy_diagnostics(self) -> None:
+        if self.diagnostics is None:
+            return
+        QGuiApplication.clipboard().setText(self.diagnostics())
+        self.toasts.show("copied", "Diagnostics copied", "Versions, browsers, settings and the latest problems")
 
     def save(self) -> None:
         """Saves every entry (all levels, ignoring the search) to a plain-text file."""

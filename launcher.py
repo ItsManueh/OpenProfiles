@@ -1,7 +1,10 @@
 """
 Opening profiles with Playwright: browser installation, launch options for each
-mode, file chooser and the lifecycle of each window. Several profiles can be
-open at the same time.
+mode, file chooser, the dialogs and downloads of the pages, and the lifecycle of
+each window. Several profiles can be open at the same time.
+
+The anti-detection measures are in stealth.py and what is kept between sessions
+(session cookies, tabs, downloads) in browser_session.py.
 """
 
 from __future__ import annotations
@@ -22,9 +25,21 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
 import playwright
-from playwright.async_api import BrowserContext, FileChooser, Frame, Page, Playwright, async_playwright
+from playwright.async_api import (
+    BrowserContext,
+    Dialog,
+    Download,
+    FileChooser,
+    Frame,
+    Page,
+    Playwright,
+    async_playwright,
+)
 from playwright.async_api import Error as PlaywrightError
 
+import browser_session
+import stealth
+from browser_session import SessionKeeper, safe_url
 from profiles import BROWSERS_DIR, Devices, Profile, describe
 
 if TYPE_CHECKING:
@@ -32,16 +47,14 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("app.launcher")
 
-# notify(profile_name, state, message) with state "opened", "warning", "error" or "closed".
+# notify(profile_name, state, message) with state "opened", "warning", "error", "saved"
+# (a download was saved; the message is the file name) or "closed".
 Notify = Callable[[str, str, str], None]
 # choose_files(multiple, accept) -> paths picked by the user.
 ChooseFiles = Callable[[bool, str], Awaitable[list[str]]]
-
-# WebKit on Windows reports no touch points even when emulating a phone;
-# a real iPhone reports 5.
-TOUCH_POINTS_SCRIPT = (
-    "Object.defineProperty(Navigator.prototype, 'maxTouchPoints', {get: () => 5, configurable: true});"
-)
+# ask_dialog(kind, message, default_text, site) -> (accepted, text). kind: alert, confirm, prompt
+# or beforeunload ("Leave site?"); site is the address of the page that asks.
+AskDialog = Callable[[str, str, str, str], Awaitable[tuple[bool, str]]]
 # Largest size of the desktop-mode window (it never covers the whole screen).
 DESKTOP_WINDOW_MAX = (1440, 900)
 
@@ -329,25 +342,63 @@ async def _ask_files_in_thread(multiple: bool, accept: str) -> list[str]:
     return await asyncio.to_thread(ask_files, multiple, accept)
 
 
+def ask_dialog(kind: str, message: str, default: str, site: str) -> tuple[bool, str]:
+    """A page's alert, confirm, prompt or "leave site?" question, on top of every other
+    window (command line only; the graphical interface shows its own)."""
+    import tkinter as tk
+    from tkinter import messagebox, simpledialog
+
+    with _dialog_lock:
+        owner = tk.Tk()
+        owner.withdraw()
+        owner.attributes("-topmost", True)  # pyright: ignore[reportUnknownMemberType]
+        title = f"{site} says"
+        try:
+            if kind == "alert":
+                messagebox.showinfo(title, message, parent=owner)
+                return True, ""
+            if kind == "prompt":
+                text = simpledialog.askstring(title, message, initialvalue=default, parent=owner)
+                return text is not None, text or ""
+            if kind == "beforeunload":
+                question = "Leave this page? Changes you made may not be saved."
+                return bool(messagebox.askokcancel("Leave site?", question, parent=owner)), ""
+            return bool(messagebox.askokcancel(title, message, parent=owner)), ""
+        finally:
+            owner.destroy()
+
+
+async def _ask_dialog_in_thread(kind: str, message: str, default: str, site: str) -> tuple[bool, str]:
+    return await asyncio.to_thread(ask_dialog, kind, message, default, site)
+
+
 # ----------------------------------------------------------------------------
 # Opening profiles
 # ----------------------------------------------------------------------------
 
 
 def launch_options(profile: Profile, devices: Devices) -> dict[str, Any]:
+    languages = stealth.languages(profile.locale, profile.engine, profile.mode)
     options: dict[str, Any] = {
         "headless": False,
         "locale": profile.locale,
         "timezone_id": profile.timezone,
         "color_scheme": "light" if profile.theme == "light" else "dark",
+        "extra_http_headers": {"Accept-Language": stealth.accept_language(languages)},
+        "accept_downloads": True,  # saved to the Downloads folder (see browser_session.py)
     }
+    if profile.engine == "chromium" or profile.mode == "desktop":
+        # Without Playwright's automation flag (navigator.webdriver, the automation bar)
+        # and with the pop-up blocker on, like any Chrome.
+        options["ignore_default_args"] = list(stealth.CHROMIUM_IGNORED_ARGS)
+        options["args"] = list(stealth.CHROMIUM_ARGS)
     if profile.mode == "desktop":
         # A normal window (not maximized), centered; the page follows the window size.
         # Size and position are always passed, otherwise Chromium restores the last
         # placement saved in the profile, which may be maximized.
         width, height, left, top = desktop_window_bounds()
         options["no_viewport"] = True
-        options["args"] = [f"--window-size={width},{height}", f"--window-position={left},{top}"]
+        options["args"] += [f"--window-size={width},{height}", f"--window-position={left},{top}"]
         log.debug("Desktop window %dx%d at (%d, %d)", width, height, left, top)
     else:
         device = dict(devices[profile.device])
@@ -357,6 +408,7 @@ def launch_options(profile: Profile, devices: Devices) -> dict[str, Any]:
             # 9 times more pixels and scrolling stutters. Use the real screen scale.
             device["device_scale_factor"] = screen_scale()
         options.update(device)
+        options["screen"] = stealth.iphone_screen(device)  # the whole screen, not only the page area
         viewport: dict[str, int] = device.get("viewport", {})
         log.debug(
             "Emulating %s: %sx%s, scale %s",
@@ -365,8 +417,8 @@ def launch_options(profile: Profile, devices: Devices) -> dict[str, Any]:
             viewport.get("height"),
             device.get("device_scale_factor"),
         )
-    if profile.user_agent:
-        options["user_agent"] = profile.user_agent
+    if user_agent := stealth.user_agent_for(profile):
+        options["user_agent"] = user_agent
     return options
 
 
@@ -379,7 +431,14 @@ def print_notice(name: str, _state: str, message: str) -> None:
     print(f"[{name}] {message}")
 
 
+# The session keeper of every open context: whoever closes a profile saves its session first.
+_keepers: dict[BrowserContext, SessionKeeper] = {}
+
+
 async def close_quietly(context: BrowserContext) -> None:
+    keeper = _keepers.get(context)
+    if keeper is not None:
+        await keeper.close()
     with contextlib.suppress(PlaywrightError):
         await context.close()
 
@@ -392,19 +451,28 @@ async def run_profile(
     notify: Notify = print_notice,
     contexts: dict[str, BrowserContext] | None = None,
     choose_files: ChooseFiles | None = None,
+    ask: AskDialog | None = None,
+    restore_tabs: bool = True,
 ) -> None:
     """Opens a profile and waits until its window is closed.
 
     `contexts` (optional) registers the open context so it can be closed from
     outside. `choose_files` shows the file chooser when a page asks for one in
-    WebKit; by default one is opened in a separate thread.
+    WebKit, and `ask` the alerts, confirmations and prompts of the pages; by default
+    they are opened in a separate thread. With `restore_tabs` the tabs open the last
+    time are opened again instead of the start page.
     """
     choose = choose_files or _ask_files_in_thread
+    ask_user = ask or _ask_dialog_in_thread
     name = profile.name
     log.info("Launching '%s' (%s)", name, describe(profile))
     browser_type = pw.webkit if profile.engine == "webkit" else pw.chromium
+    device = devices.get(profile.device) if profile.mode == "iphone" else None
     try:
         profile.folder.mkdir(parents=True, exist_ok=True)
+        if browser_type is pw.chromium:
+            browser_session.mark_clean_exit(profile.folder)
+        saved = browser_session.load_session(profile.folder)
         context = await browser_type.launch_persistent_context(str(profile.folder), **launch_options(profile, devices))
     except OSError as e:
         log.error("Could not create the data folder of '%s': %s", name, e)
@@ -418,15 +486,20 @@ async def run_profile(
     # Registered first, so the close is not missed if the window closes right away.
     closed = asyncio.Event()
     context.on("close", lambda _context: closed.set())
+    keeper = SessionKeeper(context, profile.folder, name)
+    _keepers[context] = keeper
     pending: set[asyncio.Task[None]] = set()  # keeps references so the tasks are not lost
+
+    def start(coroutine: Awaitable[None]) -> None:
+        task = asyncio.ensure_future(coroutine)
+        pending.add(task)
+        task.add_done_callback(pending.discard)
 
     def on_page_close(_page: Page) -> None:
         # Closing the last tab closes the whole profile.
         if not context.pages and not closed.is_set():
             log.debug("'%s': no tabs left, closing the profile", name)
-            task = asyncio.ensure_future(close_quietly(context))
-            pending.add(task)
-            task.add_done_callback(pending.discard)
+            start(close_quietly(context))
 
     async def on_file_chooser(chooser: FileChooser) -> None:
         try:
@@ -444,15 +517,43 @@ async def run_profile(
                 log.warning("'%s': the files could not be delivered: %s", name, e)
                 notify(name, "warning", f"The files could not be delivered: {_first_line(e)}")
 
+    async def on_dialog(dialog: Dialog) -> None:
+        """Without this, Playwright would dismiss every alert, confirm and prompt on its own."""
+        site = safe_url(dialog.page.url if dialog.page else "")
+        log.info("'%s': the page shows a %s dialog", name, dialog.type)
+        try:
+            accepted, text = await ask_user(dialog.type, dialog.message, dialog.default_value, site)
+            if accepted:
+                await dialog.accept(text) if dialog.type == "prompt" else await dialog.accept()
+            else:
+                await dialog.dismiss()
+        except PlaywrightError as e:  # the page closed while the question was shown
+            log.debug("'%s': the dialog was already gone: %s", name, e)
+
+    async def on_download(download: Download) -> None:
+        """Playwright would delete downloads when the window closes: keep a copy in Downloads."""
+        try:
+            folder = browser_session.downloads_folder()
+            folder.mkdir(parents=True, exist_ok=True)
+            path = browser_session.unique_path(folder, download.suggested_filename)
+            await download.save_as(path)
+        except (PlaywrightError, OSError) as e:
+            if not closed.is_set():
+                log.warning("'%s': the download could not be saved: %s", name, e)
+                notify(name, "warning", f"The download could not be saved: {_first_line(e)}")
+            return
+        log.info("'%s': downloaded %s", name, path, extra={"event": "saved"})
+        notify(name, "saved", path.name)
+
     def prepare_page(page: Page) -> None:
         log.debug("'%s': new tab", name)
 
         def on_navigated(frame: Frame) -> None:
             if frame == page.main_frame:
-                log.debug("'%s': navigated to %s", name, frame.url)
+                log.debug("'%s': navigated to %s", name, safe_url(frame.url))
 
         def on_crash(_page: Page) -> None:
-            log.error("'%s': the page crashed (%s)", name, page.url)
+            log.error("'%s': the page crashed (%s)", name, safe_url(page.url))
 
         def on_page_error(error: Exception) -> None:
             # Websites throw many harmless JavaScript errors, so they are only debug entries.
@@ -462,6 +563,9 @@ async def run_profile(
         page.on("framenavigated", on_navigated)
         page.on("crash", on_crash)
         page.on("pageerror", on_page_error)
+        page.on("dialog", lambda dialog: start(on_dialog(dialog)))
+        page.on("download", lambda download: start(on_download(download)))
+        keeper.track(page)
         if profile.engine == "webkit":
             page.on("filechooser", on_file_chooser)
 
@@ -475,23 +579,37 @@ async def run_profile(
         log.info("'%s' is open as %s", name, label, extra={"event": "opened"})
         notify(name, "opened", f"Opened as {label} ({profile.engine}).")
         try:
-            if profile.mode == "iphone":
-                await context.add_init_script(TOUCH_POINTS_SCRIPT)
+            await context.add_init_script(stealth.init_script(profile, device))
+            await keeper.restore(saved)
             page = context.pages[0] if context.pages else await context.new_page()
             if page.url in ("", "about:blank"):
-                await page.goto(profile.start_url, wait_until="domcontentloaded", timeout=60_000)
-                log.info("'%s' loaded %s", name, profile.start_url)
+                tabs = saved.tabs if restore_tabs and saved.tabs else [profile.start_url]
+                if tabs != [profile.start_url]:
+                    log.info("'%s': reopening %d tab(s) from the last session", name, len(tabs))
+                for url in tabs[1:]:  # the others load in the background
+                    start(_open_tab(context, url, name))
+                await page.goto(tabs[0], wait_until="domcontentloaded", timeout=60_000)
+                log.info("'%s' loaded %s", name, safe_url(tabs[0]))
         except PlaywrightError as e:
             if not closed.is_set():
-                log.warning("'%s': problem loading %s: %s", name, profile.start_url, e)
-                notify(name, "warning", f"Problem loading {profile.start_url}: {_first_line(e)}")
+                log.warning("'%s': problem loading the page: %s", name, e)
+                notify(name, "warning", f"Problem loading the page: {_first_line(e)}")
         await closed.wait()
     finally:
         await close_quietly(context)
+        _keepers.pop(context, None)
         if contexts is not None:
             contexts.pop(name, None)
         log.info("'%s' closed, session saved", name, extra={"event": "closed"})
         notify(name, "closed", "Closed. Session saved.")
+
+
+async def _open_tab(context: BrowserContext, url: str, name: str) -> None:
+    try:
+        page = await context.new_page()
+        await page.goto(url, wait_until="domcontentloaded", timeout=60_000)
+    except PlaywrightError as e:
+        log.debug("'%s': could not reopen %s: %s", name, safe_url(url), e)
 
 
 async def _run_many(profiles: list[Profile]) -> None:

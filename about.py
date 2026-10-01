@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 APP_NAME = "OpenProfiles"
-APP_VERSION = "0.2.1"  # keep in sync with the tag of the GitHub release (v0.2.1)
+APP_VERSION = "0.3.0"  # keep in sync with the tag of the GitHub release (v0.3.0)
 REPOSITORY = "ItsManueh/OpenProfiles"
 RELEASES_URL = f"https://github.com/{REPOSITORY}/releases/latest"
 LATEST_RELEASE_API = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"

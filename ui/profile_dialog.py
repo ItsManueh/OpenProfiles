@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
-from PySide6.QtWidgets import QComboBox, QGridLayout, QLineEdit, QWidget
+from PySide6.QtGui import QKeySequence, QShortcut
+from PySide6.QtWidgets import QComboBox, QGridLayout, QLineEdit, QStackedWidget, QVBoxLayout, QWidget
 
 from profiles import (
     IPHONE_MODELS,
+    NOTES_MAX,
     START_URL,
     Profile,
     ProfileError,
@@ -18,7 +20,7 @@ from profiles import (
 )
 from ui.controller import AppController
 from ui.dialog import Dialog
-from ui.widgets import SegmentedControl, hbox, make_button, make_label
+from ui.widgets import ColorPicker, SegmentedControl, hbox, make_button, make_label
 
 RANDOM = "Random"
 MODE_LABELS = {"desktop": "Desktop", "iphone": "iPhone"}  # also the order shown in the dialog
@@ -52,11 +54,46 @@ def combo(options: Sequence[str], current: str) -> QComboBox:
     return box
 
 
+FIELD_WIDTH = 236  # each of the two columns
+
+
+def field(text: str, widget: QWidget) -> QWidget:
+    """A field: its name above the control; hiding it hides both."""
+    box = QWidget()
+    layout = QVBoxLayout(box)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setSpacing(6)
+    layout.addWidget(make_label(text, "field"))
+    layout.addWidget(widget)
+    return box
+
+
+def form(*rows: tuple[QWidget, ...]) -> QWidget:
+    """Rows of one or two fields, in two equal columns."""
+    page = QWidget()
+    grid = QGridLayout(page)
+    grid.setContentsMargins(0, 0, 0, 0)
+    grid.setHorizontalSpacing(14)
+    grid.setVerticalSpacing(14)
+    grid.setColumnMinimumWidth(0, FIELD_WIDTH)
+    grid.setColumnMinimumWidth(1, FIELD_WIDTH)
+    for row, fields in enumerate(rows):
+        if len(fields) == 1:
+            grid.addWidget(fields[0], row, 0, 1, 2)
+        else:
+            for column, widget in enumerate(fields):
+                grid.addWidget(widget, row, column)
+    grid.setRowStretch(len(rows), 1)
+    return page
+
+
 class ProfileDialog(Dialog):
     """Creates a profile (profile=None) or edits one.
 
-    In "Desktop" mode the engine is always Chromium, so the iPhone model, engine
-    and quality are hidden. Quality is only shown with WebKit.
+    Two tabs keep it compact: "Profile" (name, label, mode and device, notes) and
+    "Browser" (theme, language, time zone, start page and user-agent). In "Desktop"
+    mode the engine is always Chromium, so the iPhone model, engine and quality are
+    hidden; quality is only shown with WebKit.
     """
 
     def __init__(self, controller: AppController, profile: Profile | None = None, parent: QWidget | None = None):
@@ -74,70 +111,80 @@ class ProfileDialog(Dialog):
         # Last user-agent filled in automatically: unless the user edited it by
         # hand, it is regenerated when the mode or model changes.
         self._auto_user_agent = profile.user_agent if profile else ""
-        root = self.body
 
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(16)
-        grid.setVerticalSpacing(4)
-        grid.setColumnMinimumWidth(0, 282)
-        grid.setColumnMinimumWidth(1, 282)
-        root.addLayout(grid)
-        self._grid = grid
-
+        # --- "Profile" tab ---
         self.name_edit = QLineEdit()
         self.name_edit.setPlaceholderText("account_1")
-        self._add_field("Name", self.name_edit, row=0, span=2)
-
+        self.color = ColorPicker()
         self.mode = SegmentedControl(list(MODE_LABELS.values()), expand=True)
         self.mode.changed.connect(self._on_mode_change)
-        self._add_field("Mode", self.mode, row=2, span=2)
-
-        # iPhone mode only
         models = list(reversed(list(self.devices)))
         self.device_box = combo(models if editing else [RANDOM, *models], RANDOM)
         self.engine = SegmentedControl(list(ENGINE_LABELS.values()), expand=True)
         self.engine.changed.connect(self._on_engine_change)
         self.quality = SegmentedControl(list(QUALITY_LABELS.values()), expand=True)
-        self._iphone_fields = [
-            *self._add_field("iPhone", self.device_box, row=4, span=2),
-            *self._add_field("Engine", self.engine, row=6),
-        ]
-        self._quality_fields = self._add_field("WebKit quality", self.quality, row=6, column=1)
+        self.notes_edit = QLineEdit()
+        self.notes_edit.setPlaceholderText("Which account it is, for example")
+        self.notes_edit.setMaxLength(NOTES_MAX)
+        self._device_field = field("iPhone", self.device_box)
+        self._engine_field = field("Engine", self.engine)
+        self._quality_field = field("WebKit quality", self.quality)
+        profile_tab = form(
+            (field("Name", self.name_edit), field("Label", self.color)),
+            (field("Mode", self.mode),),
+            (self._device_field,),
+            (self._engine_field, self._quality_field),
+            (field("Notes", self.notes_edit),),
+        )
 
+        # --- "Browser" tab ---
         self.browser_theme = SegmentedControl(list(THEME_LABELS.values()), expand=True)
-        self._add_field("Browser theme", self.browser_theme, row=8)
         locale = profile.locale if profile else "es-ES"
         self.locale_box = combo(with_current(LOCALES, locale), locale)
-        self._add_field("Language", self.locale_box, row=8, column=1)
-
         timezone = profile.timezone if profile else "Europe/Madrid"
         self.timezone_box = combo(with_current(TIMEZONES, timezone), timezone)
-        self._add_field("Time zone", self.timezone_box, row=10)
         self.url_edit = QLineEdit()
         self.url_edit.setPlaceholderText(START_URL)
-        self._add_field("Start URL", self.url_edit, row=10, column=1)
-
         self.ua_edit = QLineEdit()
-        self.ua_edit.setPlaceholderText("Leave empty to generate a random one on save")
-        random_button = make_button("Random", width=104)
+        self.ua_edit.setPlaceholderText("Leave empty to generate one on save")
+        random_button = make_button("Random", width=96)
         random_button.clicked.connect(self._randomize_user_agent)
         ua_row = QWidget()
         ua_row.setLayout(hbox(self.ua_edit, random_button))
-        self._add_field("User-agent", ua_row, row=12, span=2)
+        browser_tab = form(
+            (field("Browser theme", self.browser_theme), field("Language", self.locale_box)),
+            (field("Time zone", self.timezone_box), field("Start URL", self.url_edit)),
+            (field("User-agent", ua_row),),
+        )
+
+        self.tabs = SegmentedControl(["Profile", "Browser"], small=True, expand=True)
+        self.tabs.setToolTip("Ctrl+Tab switches between the tabs")
+        self.tabs.changed.connect(self._on_tab_change)
+        QShortcut(QKeySequence("Ctrl+Tab"), self).activated.connect(
+            lambda: self.show_tab("Browser" if self.tabs.value() == "Profile" else "Profile")
+        )
+        self.pages = QStackedWidget()
+        self.pages.addWidget(profile_tab)
+        self.pages.addWidget(browser_tab)
 
         self.hint = make_label(role="small", wrap=True)
         self.error = make_label(role="error", wrap=True)
         self.error.hide()
-        root.addWidget(self.hint)
-        root.addSpacing(4)
-        root.addWidget(self.error)
-        root.addSpacing(18)
-
         cancel = make_button("Cancel", width=104)
         cancel.clicked.connect(self.reject)
         save = make_button("Save" if editing else "Create", "primary", width=104)
         save.clicked.connect(self._save)
         save.setDefault(True)  # Enter saves
+
+        root = self.body
+        root.addWidget(self.tabs)
+        root.addSpacing(18)
+        root.addWidget(self.pages)
+        root.addSpacing(14)
+        root.addWidget(self.hint)
+        root.addSpacing(4)
+        root.addWidget(self.error)
+        root.addSpacing(16)
         root.addLayout(hbox(None, cancel, save))
 
         # Initial values
@@ -152,12 +199,15 @@ class ProfileDialog(Dialog):
             self.url_edit.setText(profile.start_url)
             self.ua_edit.setText(profile.user_agent)
             self.ua_edit.setCursorPosition(0)
+            self.notes_edit.setText(profile.notes)
+            self.color.set_value(profile.color)
         else:
             self.mode.set_value(MODE_LABELS["desktop"])
             self.engine.set_value(ENGINE_LABELS["webkit"])
             self.quality.set_value(QUALITY_LABELS["smooth"])
             self.browser_theme.set_value(THEME_LABELS["dark"])
             self.url_edit.setText(START_URL)
+        self.tabs.set_value("Profile")
         self._update_visibility()
         if not editing:
             self._regenerate_if_auto()  # show the random user-agent of the default mode right away
@@ -165,14 +215,12 @@ class ProfileDialog(Dialog):
         self.device_box.currentTextChanged.connect(self._on_device_change)
         self.name_edit.setFocus()
 
-    # --- layout -------------------------------------------------------------
-    def _add_field(self, text: str, widget: QWidget, *, row: int, column: int = 0, span: int = 1) -> list[QWidget]:
-        """Places a label and a widget on two rows; returns both so they can be hidden."""
-        label = make_label(text, "field")
-        self._grid.addWidget(label, row, column, 1, span)
-        self._grid.addWidget(widget, row + 1, column, 1, span)
-        self._grid.setRowMinimumHeight(row + 1, 46)  # room below each field
-        return [label, widget]
+    def _on_tab_change(self, tab: str) -> None:
+        self.pages.setCurrentIndex(0 if tab == "Profile" else 1)
+
+    def show_tab(self, tab: str) -> None:
+        self.tabs.set_value(tab)
+        self._on_tab_change(tab)
 
     # --- widget state -------------------------------------------------------
     def selected_mode(self) -> str:
@@ -183,15 +231,11 @@ class ProfileDialog(Dialog):
 
     def _update_visibility(self) -> None:
         iphone = self.selected_mode() == "iphone"
-        for widget in self._iphone_fields:
-            widget.setVisible(iphone)
-        for widget in self._quality_fields:
-            widget.setVisible(iphone and self.selected_engine() == "webkit")
-        # Hidden rows must not keep their minimum height.
-        for row in (5, 7):
-            self._grid.setRowMinimumHeight(row, 46 if iphone else 0)
+        self._device_field.setVisible(iphone)
+        self._engine_field.setVisible(iphone)
+        self._quality_field.setVisible(iphone and self.selected_engine() == "webkit")
         if not iphone:
-            hint = "Full Chromium browser, without emulation. Random Chrome or Edge for Windows user-agent."
+            hint = "Full Chromium browser, without emulation, with a Chrome for Windows user-agent that matches it."
         elif self.selected_engine() == "webkit":
             hint = (
                 'Emulates the iPhone screen and touch. "Smooth" renders at your screen\'s resolution '
@@ -251,6 +295,11 @@ class ProfileDialog(Dialog):
     def _show_error(self, text: str) -> None:
         self.error.setText(text)
         self.error.setVisible(bool(text))
+        # The problem may be in the other tab (the start URL, for example): show it.
+        if any(word in text for word in ("URL", "language", "time zone", "user-agent")):
+            self.show_tab("Browser")
+        elif text:
+            self.show_tab("Profile")
 
     def _save(self) -> None:
         device = self.device_box.currentText()
@@ -265,6 +314,8 @@ class ProfileDialog(Dialog):
             timezone=self.timezone_box.currentText(),
             start_url=self.url_edit.text(),
             user_agent=self.ua_edit.text(),
+            notes=self.notes_edit.text(),
+            color=self.color.value(),
         )
         try:
             self.saved = self.controller.save_profile(profile, self.original.name if self.original else None)

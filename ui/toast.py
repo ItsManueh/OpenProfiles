@@ -4,11 +4,14 @@ tinted by their type, with a colored icon and lowercase monospaced text, that sl
 in at the bottom-right corner of a window, stack upwards and fade away on their own.
 
 - Hovering a toast keeps it on screen; clicking it dismisses it.
+- A toast can carry one action, e.g. "Undo" after deleting a profile.
 - Toasts of the same group that arrive while one is still visible are merged
   ("3 profiles opened") instead of piling up; their different details are listed.
 """
 
 from __future__ import annotations
+
+from collections.abc import Callable
 
 from PySide6.QtCore import (
     QAbstractAnimation,
@@ -27,6 +30,7 @@ from PySide6.QtWidgets import (
     QFrame,
     QGraphicsOpacityEffect,
     QHBoxLayout,
+    QPushButton,
     QVBoxLayout,
     QWidget,
 )
@@ -51,6 +55,9 @@ SLIDE_PX = 14  # new toasts rise this much while they fade in
 ICON_SIZE = 17
 PADDING = 14
 TEXT_WIDTH = CARD_WIDTH - 2 * PADDING - ICON_SIZE - 10 - 2  # icon, spacing and border
+ACTION_WIDTH = 64  # the action button, and the space next to it
+
+Action = tuple[str, Callable[[], None]]  # label and what it does
 
 
 class Toast(QWidget):
@@ -62,9 +69,12 @@ class Toast(QWidget):
 
     finished = Signal(object)  # emitted with itself once it has faded out
 
-    def __init__(self, parent: QWidget, kind: str, title: str, detail: str):
+    def __init__(
+        self, parent: QWidget, kind: str, title: str, detail: str, action: Action | None = None, duration: int = 0
+    ):
         super().__init__(parent)
         self.kind = kind
+        self.text_width = TEXT_WIDTH - (ACTION_WIDTH + 10 if action else 0)
         self.group: str | None = None
         self.plural = ""
         self.count = 1  # notifications merged into this one
@@ -91,6 +101,16 @@ class Toast(QWidget):
         self._box.setSpacing(10)
         self._box.addWidget(icon, 0, Qt.AlignmentFlag.AlignTop)
         self._box.addLayout(texts, 1)
+        self.action: QPushButton | None = None
+        if action is not None:
+            label, callback = action
+            self.action = QPushButton(label)
+            self.action.setObjectName("toastAction")
+            self.action.setFixedWidth(ACTION_WIDTH)
+            self.action.setCursor(Qt.CursorShape.PointingHandCursor)
+            self.action.clicked.connect(callback)
+            self.action.clicked.connect(self.dismiss)
+            self._box.addWidget(self.action, 0, Qt.AlignmentFlag.AlignVCenter)
         outer = QVBoxLayout(self)
         outer.setContentsMargins(SHADOW, SHADOW, SHADOW, SHADOW)
         outer.addWidget(self.card)
@@ -107,12 +127,12 @@ class Toast(QWidget):
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self.dismiss)
-        self.duration = PROBLEM_VISIBLE_MS if tone in ("warning", "error") else VISIBLE_MS
+        self.duration = duration or (PROBLEM_VISIBLE_MS if tone in ("warning", "error") else VISIBLE_MS)
 
     def set_text(self, title: str, detail: str) -> None:
         self.title.setText(title.lower())  # lowercase titles, as in SpotiFLAC
         # One line of detail; the full text stays in the tooltip when it does not fit.
-        elided = QFontMetrics(self.detail.font()).elidedText(detail, Qt.TextElideMode.ElideMiddle, TEXT_WIDTH)
+        elided = QFontMetrics(self.detail.font()).elidedText(detail, Qt.TextElideMode.ElideMiddle, self.text_width)
         self.detail.setText(elided)
         self.detail.setToolTip(detail if elided != detail else "")
         self.detail.setVisible(bool(detail))
@@ -196,11 +216,22 @@ class ToastHost(QObject):
         self.toasts: list[Toast] = []  # oldest first
         area.installEventFilter(self)
 
-    def show(self, kind: str, title: str, detail: str = "", *, group: str | None = None, plural: str = "") -> Toast:
+    def show(
+        self,
+        kind: str,
+        title: str,
+        detail: str = "",
+        *,
+        group: str | None = None,
+        plural: str = "",
+        action: Action | None = None,
+        duration: int = 0,
+    ) -> Toast:
         """Shows a toast. With `group`, a visible toast of the same group absorbs this one:
         its title becomes `plural` (with {n} replaced by the count) and its detail lists
-        the different details, once each."""
-        if group is not None:
+        the different details, once each. A toast with an `action` is never merged; it
+        stays `duration` milliseconds (or the usual time)."""
+        if group is not None and action is None:
             for toast in reversed(self.toasts):
                 if toast.group == group and not toast.closing:
                     toast.count += 1
@@ -210,8 +241,8 @@ class ToastHost(QObject):
                     toast.restart_timer()
                     self._layout()
                     return toast
-        toast = Toast(self.area, kind, title, detail)
-        toast.group = group
+        toast = Toast(self.area, kind, title, detail, action, duration)
+        toast.group = group if action is None else None
         toast.plural = plural
         toast.details = [detail] if detail else []
         toast.finished.connect(self._remove)

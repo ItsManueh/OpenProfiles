@@ -22,6 +22,7 @@ from ui.single_instance import SingleInstance
 
 log = logging.getLogger("app.gui")
 APP_ID = APP_NAME
+FONT_ENGINE = "windows:fontengine=freetype"
 
 
 def create_app(argv: list[str] | None = None) -> tuple[QApplication, MainWindow]:
@@ -36,7 +37,7 @@ def create_app(argv: list[str] | None = None) -> tuple[QApplication, MainWindow]
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)
 
     existing = QApplication.instance()
-    app = existing if isinstance(existing, QApplication) else QApplication(argv if argv is not None else sys.argv)
+    app = existing if isinstance(existing, QApplication) else QApplication(qt_arguments(argv))
     instance = SingleInstance(DATA_DIR, app)
     if instance.notify_running_instance():
         log.info("The app is already running; brought its window to the front")
@@ -58,6 +59,16 @@ def create_app(argv: list[str] | None = None) -> tuple[QApplication, MainWindow]
     window.bring_to_front()  # in front of the window that was active while the app started
     controller.start()
     return app, window
+
+
+def qt_arguments(argv: list[str] | None) -> list[str]:
+    """The arguments for Qt. On Windows text is drawn with FreeType: Geist is a web font without
+    hinting, and DirectWrite (Qt's default) leaves it blurry; FreeType fits it to the pixel grid
+    (measured: about a fifth fewer half-tone pixels), so text looks sharp."""
+    arguments = list(argv if argv is not None else sys.argv) or [APP_ID]
+    if sys.platform == "win32" and "-platform" not in arguments:
+        arguments += ["-platform", FONT_ENGINE]
+    return arguments
 
 
 def _report_unhandled_errors(window: MainWindow) -> None:
