@@ -399,5 +399,8 @@ def delete_profile(name: str) -> None:
         except OSError as e:  # e.g. a file still in use by another program
             raise ProfileError(f"Could not delete the data of '{name}': {e}") from e
     del profiles[name]
-    save_profiles(profiles)
+    try:
+        save_profiles(profiles)
+    except OSError as e:  # the data is gone; the next load still lists it, with an empty session
+        raise ProfileError(f"The data of '{name}' was deleted, but the list could not be saved: {e}") from e
     log.info("Deleted profile '%s' and its data", name, extra={"event": "deleted"})

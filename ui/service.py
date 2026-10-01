@@ -21,6 +21,8 @@ from profiles import Devices, Profile
 
 log = logging.getLogger("app.gui")
 
+SHUTDOWN_SECONDS = 15  # time the profiles have to close and save their sessions when the app quits
+
 # Future the interface resolves with the files picked in the chooser.
 FilesFuture = concurrent.futures.Future[list[str]]
 
@@ -46,6 +48,7 @@ class BrowserService:
         self.devices: Devices = {}
         self.contexts: dict[str, BrowserContext] = {}
         self.tasks: dict[str, asyncio.Task[None]] = {}
+        self.stopping = False  # set by stop(): nothing new opens, and a running download is cancelled
 
     # --- service thread -----------------------------------------------------
     def start(self) -> None:
@@ -57,9 +60,13 @@ class BrowserService:
         try:
             if not launcher.browsers_installed():
                 self.signals.info.emit("Downloading browsers (first run only)…")
-                launcher.install_browsers(quiet=True)
+                launcher.install_browsers(quiet=True, on_progress=self.signals.info.emit)
+                self.signals.info.emit("Starting the browsers…")
                 self.signals.installed.emit()
             self.loop.run_until_complete(self._start_playwright())
+        except launcher.InstallCancelledError:  # the app is closing
+            self.loop.close()
+            return
         except Exception as e:  # shown in the interface
             log.exception("The browser engine could not start")
             self.signals.failed.emit(f"The browser engine could not start: {e}")
@@ -95,18 +102,20 @@ class BrowserService:
 
     def stop(self) -> None:
         """Closes every profile (saving its session) and stops the thread. Blocks: call it off the UI thread."""
+        self.stopping = True
         if not self.ready.is_set():
+            launcher.cancel_install()  # closing during the first download: do not leave it running
             return
         log.info("Stopping the browser engine")
         future = asyncio.run_coroutine_threadsafe(self._shutdown(), self.loop)
         with contextlib.suppress(Exception):  # the app is shutting down
-            future.result(timeout=20)
+            future.result(timeout=SHUTDOWN_SECONDS + 5)
         self.loop.call_soon_threadsafe(self.loop.stop)
         self.thread.join(timeout=5)
 
     # --- coroutines (service thread) ----------------------------------------
     async def _open(self, profile: Profile) -> None:
-        if profile.name not in self.tasks:
+        if profile.name not in self.tasks and not self.stopping:
             self.tasks[profile.name] = asyncio.create_task(self._run_profile(profile))
 
     async def _choose_files(self, multiple: bool, accept: str) -> list[str]:
@@ -145,9 +154,16 @@ class BrowserService:
             await launcher.close_quietly(context)
 
     async def _shutdown(self) -> None:
-        for context in list(self.contexts.values()):
-            await launcher.close_quietly(context)
+        """Closes every profile, including those still opening: their window appears while
+        the app closes, and is closed as soon as it does."""
+        deadline = self.loop.time() + SHUTDOWN_SECONDS
+        closing: dict[BrowserContext, asyncio.Task[None]] = {}  # keeps references to the tasks
+        while self.tasks and self.loop.time() < deadline:
+            for context in list(self.contexts.values()):
+                if context not in closing:
+                    closing[context] = asyncio.ensure_future(launcher.close_quietly(context))
+            await asyncio.wait(list(self.tasks.values()), timeout=0.25)
         if self.tasks:
-            await asyncio.wait(list(self.tasks.values()), timeout=10)
+            log.warning("%d profile(s) did not close in time", len(self.tasks))
         if self.pw is not None:
             await self.pw.stop()

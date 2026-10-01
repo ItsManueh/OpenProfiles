@@ -28,24 +28,37 @@ class AppController(QObject):
     message = Signal(str, bool)  # progress text for the status bar, or an error (shown as a notification)
     notified = Signal(str, str, str)  # event kind (created, opened, error...), profile name, detail
     files_requested = Signal(bool, str, object)  # multiple, accept, future to resolve with the paths
+    retry_available = Signal(bool)  # the browser engine could not start: it can be started again
     shutdown_finished = Signal()
 
     def __init__(self) -> None:
         super().__init__()
-        self.service = BrowserService()
         self.ready = False
         self.states: dict[str, str] = {}
         self.closing = False
         self._load_error = ""  # last error reading profiles.json, reported once
-        signals = self.service.signals
+        self.service = self._create_service()
+
+    def _create_service(self) -> BrowserService:
+        service = BrowserService()
+        signals = service.signals
         signals.ready.connect(self._on_ready)
         signals.installed.connect(self._on_installed)
         signals.info.connect(self._on_info)
         signals.failed.connect(self._on_failed)
         signals.state.connect(self._on_state)
         signals.files.connect(self.files_requested)
+        return service
 
     def start(self) -> None:
+        """Starts the browser engine; after a failure (no connection on the first download,
+        for example) it starts a new one."""
+        if self.ready or self.closing or self.service.thread.is_alive():
+            return
+        if self.service.thread.ident is not None:  # this one already ran and failed
+            log.info("Starting the browser engine again")
+            self.service = self._create_service()
+        self.retry_available.emit(False)
         self.message.emit("Preparing browsers…", False)
         self.service.start()
 
@@ -106,7 +119,7 @@ class AppController(QObject):
             return
         try:
             delete_profile(name)
-        except ProfileError as e:
+        except (ProfileError, OSError) as e:
             log.warning("Could not delete '%s': %s", name, e)
             self.notified.emit("error", name, "Could not delete the profile. The details are in the logs.")
             return
@@ -150,6 +163,7 @@ class AppController(QObject):
         # Nothing new may open while the profiles close; the interface disables its buttons.
         self.ready = False
         self.ready_changed.emit(False)
+        self.retry_available.emit(False)
         log.info("Closing the app (%d profile(s) open)", self.open_count())
         self.message.emit("Closing profiles and saving sessions…", False)
 
@@ -175,8 +189,11 @@ class AppController(QObject):
         self.message.emit(text, False)
 
     def _on_failed(self, text: str) -> None:
-        self.message.emit("", False)  # clears "Preparing browsers…"
+        if self.closing:
+            return
+        self.message.emit("The browsers could not start.", False)  # replaces "Preparing browsers…"
         self.message.emit(text, True)
+        self.retry_available.emit(True)
 
     def _on_ready(self) -> None:
         self.ready = True
@@ -189,7 +206,8 @@ class AppController(QObject):
             self._set_state(name, OPENED)
             self.notified.emit("opened", name, "")
         elif state in ("error", "warning"):
-            self.notified.emit(state, name, text)
+            if not self.closing:  # a page cut short because the app is closing is not a problem
+                self.notified.emit(state, name, text)
         elif state == "closed":
             if not self.closing:  # quitting the app closes them all; no need to announce each one
                 self.notified.emit("closed", name, "Session saved")

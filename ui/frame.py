@@ -77,6 +77,12 @@ if sys.platform == "win32":
     user32.SetForegroundWindow.argtypes = [wintypes.HWND]
     user32.SetFocus.argtypes = [wintypes.HWND]
     kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+    kernel32.GetCurrentProcessId.restype = wintypes.DWORD
+    WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
+    user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    user32.IsWindowVisible.argtypes = [wintypes.HWND]
+    DIALOG_CLASS = "#32770"  # window class of the system dialogs
     user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
     user32.GetDpiForWindow.argtypes = [wintypes.HWND]
     user32.GetDpiForWindow.restype = ctypes.c_uint
@@ -164,7 +170,37 @@ def bring_to_front(window: QWidget) -> None:
     window.activateWindow()
     if sys.platform != "win32":
         return
-    hwnd = int(window.winId())
+    _force_foreground(int(window.winId()))
+
+
+def bring_dialog_to_front() -> bool:
+    """Brings a system dialog of this app (the file chooser) in front of the other windows.
+
+    A page asks for files from the browser window the user is using, so the chooser
+    the app opens would stay behind it. Returns whether such a dialog is open."""
+    if sys.platform != "win32":
+        return False
+    process = kernel32.GetCurrentProcessId()
+    found: list[int] = []
+
+    def check(hwnd: int, _param: int) -> bool:
+        owner = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(owner))
+        name = ctypes.create_unicode_buffer(16)
+        user32.GetClassNameW(hwnd, name, 16)
+        if owner.value == process and name.value == DIALOG_CLASS and user32.IsWindowVisible(hwnd):
+            found.append(hwnd)
+            return False  # stop: the first one is enough
+        return True
+
+    user32.EnumWindows(WNDENUMPROC(check), 0)
+    if found:
+        _force_foreground(found[0])
+    return bool(found)
+
+
+def _force_foreground(hwnd: int) -> None:
+    """Joins the input of the active window for a moment, so Windows lets `hwnd` take the foreground."""
     if user32.IsIconic(hwnd):
         user32.ShowWindow(hwnd, SW_RESTORE)
     foreground = user32.GetForegroundWindow()

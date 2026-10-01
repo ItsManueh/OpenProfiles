@@ -11,9 +11,11 @@ import contextlib
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import threading
+from collections import deque
 from collections.abc import Awaitable, Callable
 from functools import lru_cache
 from pathlib import Path
@@ -85,37 +87,110 @@ def driver_command() -> list[str]:
     return [str(node), str(driver / "package" / "cli.js")]
 
 
-def install_browsers(quiet: bool = False) -> None:
+class InstallCancelledError(RuntimeError):
+    """The download of the browsers was stopped with cancel_install()."""
+
+
+_installer: subprocess.Popen[str] | None = None
+_installer_cancelled = False
+_installer_lock = threading.Lock()
+# Lines of Playwright's installer: "Downloading Chrome for Testing 140.0.7339.16 (playwright chromium
+# v1187) from ...", "Downloading FFmpeg (playwright ffmpeg v1011) from ..." and, every 10 % of each
+# download, "|■■■■■■■■     |  10% of 147.3 MiB".
+_DOWNLOADING = re.compile(r"Downloading (.+?)(?: [\d.]+)? \(playwright ")
+_PERCENT = re.compile(r"(\d{1,3})% of ([\d.]+ ?[KMG]i?B)")
+
+
+class DownloadProgress:
+    """Turns the installer's output into a short text, e.g. "Downloading Chromium… 40 % of 147.3 MiB"."""
+
+    def __init__(self) -> None:
+        self.browser = ""
+
+    def feed(self, line: str) -> str | None:
+        if match := _DOWNLOADING.search(line):
+            self.browser = match.group(1)
+            return f"Downloading {self.browser}…"
+        if self.browser and (match := _PERCENT.search(line)):
+            return f"Downloading {self.browser}… {match.group(1)} % of {match.group(2)}"
+        return None
+
+
+def install_browsers(quiet: bool = False, on_progress: Callable[[str], None] | None = None) -> None:
     """Downloads WebKit and Chromium into BROWSERS_DIR.
 
     Runs Playwright's own installer through its bundled Node driver, the same thing
     "python -m playwright install" does; unlike that command, it also works inside
     the packaged .exe, where there is no Python to run. "--no-shell" skips the
     headless-only Chromium build (about 270 MB) that this app never uses.
+
+    quiet=True reads the installer's output instead of printing it (no console window)
+    and reports the progress to `on_progress`. cancel_install() stops it from another
+    thread; this function then raises InstallCancelledError.
     """
+    global _installer, _installer_cancelled
     print(f"Downloading WebKit and Chromium into: {BROWSERS_DIR}")
     log.info("Downloading WebKit and Chromium into %s", BROWSERS_DIR)
     no_window = subprocess.CREATE_NO_WINDOW if quiet and sys.platform == "win32" else 0
-    try:
-        result = subprocess.run(
-            [*driver_command(), "install", "--no-shell", "webkit", "chromium"],
-            env=os.environ.copy(),  # includes PLAYWRIGHT_BROWSERS_PATH
-            check=False,
-            capture_output=quiet,  # quiet: no output and no console window
-            text=True,
-            errors="replace",
-            creationflags=no_window,
-        )
-    except OSError as e:
-        log.error("The browser installer could not run: %s", e)
-        raise RuntimeError(f"The browsers could not be installed: {e}") from e
-    if result.returncode != 0:
-        # With quiet=True the output is captured, so its end goes to the log to explain the failure.
-        details = (result.stderr or result.stdout or "").strip()[-800:] if quiet else ""
-        log.error("Browser installation failed (exit code %s) %s", result.returncode, details)
+    with _installer_lock:
+        if _installer_cancelled:
+            raise InstallCancelledError("The download of the browsers was cancelled.")
+        try:
+            process = subprocess.Popen(
+                [*driver_command(), "install", "--no-shell", "webkit", "chromium"],
+                env=os.environ.copy(),  # includes PLAYWRIGHT_BROWSERS_PATH
+                stdout=subprocess.PIPE if quiet else None,
+                stderr=subprocess.STDOUT if quiet else None,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=no_window,
+            )
+        except OSError as e:
+            log.error("The browser installer could not run: %s", e)
+            raise RuntimeError(f"The browsers could not be installed: {e}") from e
+        _installer = process
+    tail: deque[str] = deque(maxlen=12)  # the end of the output explains a failure
+    progress = DownloadProgress()
+    if process.stdout is not None:
+        for line in process.stdout:
+            tail.append(line.rstrip())
+            if on_progress is not None and (text := progress.feed(line)) is not None:
+                on_progress(text)
+    returncode = process.wait()
+    with _installer_lock:
+        _installer = None
+        cancelled = _installer_cancelled
+    if cancelled:
+        log.info("The download of the browsers was cancelled")
+        raise InstallCancelledError("The download of the browsers was cancelled.")
+    if returncode != 0:
+        log.error("Browser installation failed (exit code %s) %s", returncode, "\n".join(tail))
         raise RuntimeError("The browsers could not be installed.")
     print("Browsers installed.")
     log.info("Browsers installed", extra={"event": "downloaded"})
+
+
+def cancel_install() -> None:
+    """Stops a running download of the browsers (the app is closing). The installer starts
+    its own helper processes, so the whole process tree is ended; the next start resumes,
+    since a download cut halfway is never counted as installed."""
+    global _installer_cancelled
+    with _installer_lock:
+        _installer_cancelled = True
+        process = _installer
+    if process is None or process.poll() is not None:
+        return
+    log.info("Stopping the download of the browsers")
+    if sys.platform == "win32":
+        subprocess.run(
+            ["taskkill", "/T", "/F", "/PID", str(process.pid)],
+            check=False,
+            capture_output=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+    else:
+        process.kill()
 
 
 def playwright_devices(pw: Playwright) -> Devices:

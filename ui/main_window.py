@@ -60,6 +60,8 @@ STATE_LABELS = {CLOSED: "", OPENING: "Starting…", OPENED: "Running", CLOSING: 
 LOG_POLL_MS = 100  # how often new log entries are moved to the logs window
 PAGE_MS = 200  # page transition
 PAGE_SLIDE_PX = 14
+CHOOSER_RAISE_MS = 100  # how often the file chooser is looked for, to bring it to the front
+CHOOSER_RAISE_TRIES = 30
 # Notification title of each profile event, alone and when several are merged into one.
 # Notifications never name the profile; the logs do.
 EVENT_TEXTS = {
@@ -177,6 +179,7 @@ class MainWindow(QMainWindow):
         controller.message.connect(self.show_message)
         controller.notified.connect(self._on_notified)
         controller.files_requested.connect(self._choose_files)
+        controller.retry_available.connect(self.retry_button.setVisible)
         controller.shutdown_finished.connect(self._finish_close)
         QShortcut(QKeySequence("Ctrl+N"), self).activated.connect(self.new_profile)
         QShortcut(QKeySequence("Ctrl+,"), self).activated.connect(self.toggle_settings)
@@ -255,9 +258,13 @@ class MainWindow(QMainWindow):
 
         root.addSpacing(8)
         self.status = make_label(role="small")  # progress only: starting, downloading, closing
+        self.retry_button = make_button("Retry", small=True)  # when the browsers could not start
+        self.retry_button.setToolTip("Try to start the browsers again")
+        self.retry_button.clicked.connect(self.controller.start)
+        self.retry_button.hide()
         self.logs_button = TerminalButton()
         self.logs_button.clicked.connect(self.toggle_logs)
-        root.addLayout(hbox(self.status, None, self.logs_button))
+        root.addLayout(hbox(self.status, 4, self.retry_button, None, self.logs_button))
         self.toasts = ToastHost(central, right=28, bottom=56)  # above the status bar
 
     def _empty_state(self) -> QWidget:
@@ -504,8 +511,20 @@ class MainWindow(QMainWindow):
             dialog.accepted.connect(lambda: self.controller.delete_profile(name))
 
     def _choose_files(self, multiple: bool, accept: str, future: FilesFuture) -> None:
-        """File chooser requested by a page in WebKit (see launcher.py)."""
+        """File chooser requested by a page in WebKit (see launcher.py). The page is in the
+        browser window the user is using, so the chooser is brought in front of it."""
         filters = ";;".join(f"{label} ({patterns})" for label, patterns in launcher.file_types(accept))
+        tries = 0
+
+        def raise_chooser() -> None:
+            nonlocal tries
+            tries += 1
+            if frame.bring_dialog_to_front() or tries >= CHOOSER_RAISE_TRIES:
+                raiser.stop()
+
+        raiser = QTimer(self)
+        raiser.timeout.connect(raise_chooser)
+        raiser.start(CHOOSER_RAISE_MS)
         try:
             if multiple:
                 paths, _ = QFileDialog.getOpenFileNames(self, "Select files to upload", "", filters)
@@ -516,6 +535,9 @@ class MainWindow(QMainWindow):
             log.exception("The file chooser could not be opened")
             self.show_message(f"The file chooser could not be opened: {e}", error=True)
             paths = []
+        finally:
+            raiser.stop()
+            raiser.deleteLater()
         if not future.done():
             future.set_result(paths)
 
