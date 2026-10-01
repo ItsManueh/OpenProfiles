@@ -15,9 +15,8 @@ build/
 dist/
 *.spec
 
-# Editor and OS files (the shared .vscode/settings.json is kept)
-.vscode/*
-!.vscode/settings.json
+# Editor and OS files
+.vscode/
 .idea/
 Thumbs.db
 Desktop.ini
